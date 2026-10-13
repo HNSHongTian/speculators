@@ -832,7 +832,8 @@ def parse_args():
         "--speculator-type",
         type=str,
         default="eagle3",
-        help="Type of speculator model to train (eagle3, dflash, dspark, peagle, mtp)",
+        help="Type of speculator model to train (eagle3, dflash, dspark, "
+        "dspark_layerwise, dspark_deep, peagle, mtp)",
     )
     parser.add_argument(
         "--from-pretrained",

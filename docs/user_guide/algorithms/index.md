@@ -14,6 +14,11 @@ Extends Eagle-3 with parallel multi-token prediction across multiple depths, usi
 
 Predicts all draft tokens in a single forward pass using block-based prediction with Qwen3-style draft layers. Newer, with support improving rapidly.
 
+## [DSpark Correction](dspark_correction_development_report.md)
+
+An isolated DSpark training variant that replaces the Markov head with a causal
+Correction Transformer while preserving the original `dspark` model.
+
 ## [MTP](mtp.md)
 
 Finetunes the model's native multi-token prediction head on domain-specific data. Available for models with built-in MTP support (e.g. Qwen3-Next, Qwen3.5).

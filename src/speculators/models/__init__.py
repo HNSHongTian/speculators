@@ -2,6 +2,10 @@ from speculators.models.attention import ALL_ATTENTION_FUNCTIONS  # noqa: F401
 
 from .dflash import DFlashDraftModel, DFlashSpeculatorConfig
 from .dspark import DSparkDraftModel, DSparkSpeculatorConfig
+from .dspark_correction import (
+    DSparkCorrectionDraftModel,
+    DSparkCorrectionSpeculatorConfig,
+)
 from .dspark_deep import DSparkDeepDraftModel, DSparkDeepSpeculatorConfig
 from .dspark_layerwise import (
     DSparkLayerwiseDraftModel,
@@ -14,6 +18,8 @@ from .peagle import PEagleDraftModel, PEagleSpeculatorConfig
 __all__ = [
     "DFlashDraftModel",
     "DFlashSpeculatorConfig",
+    "DSparkCorrectionDraftModel",
+    "DSparkCorrectionSpeculatorConfig",
     "DSparkDeepDraftModel",
     "DSparkDeepSpeculatorConfig",
     "DSparkDraftModel",

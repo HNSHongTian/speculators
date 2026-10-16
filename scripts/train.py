@@ -761,6 +761,24 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
     "full_attention_indices": "--full-attention-indices",
 }
 
+CORRECTION_FLAGS: dict[str, str] = {
+    "correction_output_mode": "--correction-output-mode",
+    "correction_hidden_size": "--correction-hidden-size",
+    "correction_rank": "--correction-rank",
+    "correction_num_layers": "--correction-num-layers",
+    "correction_num_heads": "--correction-num-heads",
+    "correction_gate_bias": "--correction-gate-bias",
+    "confidence_head_with_correction": "--confidence-head-with-correction",
+    "correction_hidden_aux_loss": "--correction-hidden-aux-loss",
+    "correction_hidden_aux_weight": "--correction-hidden-aux-weight",
+}
+
+MARKOV_FLAGS: dict[str, str] = {
+    "markov_rank": "--markov-rank",
+    "markov_head_type": "--markov-head-type",
+    "confidence_head_with_markov": "--confidence-head-with-markov",
+}
+
 
 def validate_draft_init_args(
     parser: argparse.ArgumentParser,
@@ -817,6 +835,40 @@ def validate_draft_init_args(
         )
 
 
+def validate_dspark_correction_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    correction_provided: set[str],
+    markov_provided: set[str],
+) -> None:
+    """Keep Correction isolated from the original DSpark CLI contract."""
+    if args.speculator_type != "dspark_correction":
+        if correction_provided:
+            flags = [CORRECTION_FLAGS[name] for name in sorted(correction_provided)]
+            parser.error(
+                "Correction options require --speculator-type dspark_correction "
+                f"(remove them or change the model type): {', '.join(flags)}"
+            )
+        return
+
+    if markov_provided:
+        flags = [MARKOV_FLAGS[name] for name in sorted(markov_provided)]
+        parser.error(
+            "dspark_correction replaces the Markov head; remove these options: "
+            f"{', '.join(flags)}"
+        )
+    if args.correction_hidden_aux_loss and args.correction_output_mode != "hidden":
+        parser.error(
+            "--correction-hidden-aux-loss requires --correction-output-mode hidden"
+        )
+    if args.correction_num_heads <= 0:
+        parser.error("--correction-num-heads must be a positive integer")
+    if args.correction_hidden_size % args.correction_num_heads:
+        parser.error(
+            "--correction-hidden-size must be divisible by --correction-num-heads"
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
@@ -833,7 +885,7 @@ def parse_args():
         type=str,
         default="eagle3",
         help="Type of speculator model to train (eagle3, dflash, dspark, "
-        "dspark_layerwise, dspark_deep, peagle, mtp)",
+        "dspark_correction, dspark_layerwise, dspark_deep, peagle, mtp)",
     )
     parser.add_argument(
         "--from-pretrained",
@@ -1205,6 +1257,62 @@ def parse_args():
         default=1.0,
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
     )
+    # Isolated DSpark Correction variant. These options are rejected for every
+    # other model type so the original DSpark configuration cannot change silently.
+    parser.add_argument(
+        "--correction-output-mode",
+        choices=["hidden", "logits"],
+        default="hidden",
+        help="DSpark Correction: residual output space (default: hidden).",
+    )
+    parser.add_argument(
+        "--correction-hidden-size",
+        type=int,
+        default=512,
+        help="DSpark Correction: causal head hidden width (default: 512).",
+    )
+    parser.add_argument(
+        "--correction-rank",
+        type=int,
+        default=256,
+        help="DSpark Correction: low-rank output width (default: 256).",
+    )
+    parser.add_argument(
+        "--correction-num-layers",
+        type=int,
+        default=1,
+        help="DSpark Correction: causal Transformer layer count (default: 1).",
+    )
+    parser.add_argument(
+        "--correction-num-heads",
+        type=int,
+        default=8,
+        help="DSpark Correction: attention head count (default: 8).",
+    )
+    parser.add_argument(
+        "--correction-gate-bias",
+        type=float,
+        default=0.0,
+        help="DSpark Correction: initial residual-gate bias (default: 0.0).",
+    )
+    parser.add_argument(
+        "--confidence-head-with-correction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="DSpark Correction: condition confidence on causal Correction state.",
+    )
+    parser.add_argument(
+        "--correction-hidden-aux-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="DSpark Correction: align corrected hidden with verifier hidden.",
+    )
+    parser.add_argument(
+        "--correction-hidden-aux-weight",
+        type=float,
+        default=0.1,
+        help="DSpark Correction: hidden-alignment loss weight (default: 0.1).",
+    )
     parser.add_argument(
         "--draft-attn-impl",
         type=str,
@@ -1369,6 +1477,14 @@ def parse_args():
 
     provided = explicitly_provided_dests(parser, DECODER_SHAPING_FLAGS)
     validate_draft_init_args(parser, args, provided)
+    correction_provided = explicitly_provided_dests(parser, CORRECTION_FLAGS)
+    markov_provided = explicitly_provided_dests(parser, MARKOV_FLAGS)
+    validate_dspark_correction_args(
+        parser,
+        args,
+        correction_provided,
+        markov_provided,
+    )
     resolve_loss_config(args.loss_fn)
 
     if args.per_position_loss_weight == "dpace":

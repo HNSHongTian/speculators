@@ -1,5 +1,7 @@
 """Tests for CLI arguments."""
 
+import pytest
+
 from scripts.train import parse_args
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
@@ -160,6 +162,62 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+
+
+def test_dspark_correction_cli_options(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark_correction",
+            "--correction-output-mode",
+            "logits",
+            "--correction-hidden-size",
+            "384",
+            "--correction-rank",
+            "128",
+            "--correction-num-layers",
+            "2",
+            "--correction-num-heads",
+            "6",
+            "--correction-gate-bias",
+            "-1.5",
+            "--no-confidence-head-with-correction",
+        ],
+    )
+    assert args.correction_output_mode == "logits"
+    assert args.correction_hidden_size == 384
+    assert args.correction_rank == 128
+    assert args.correction_num_layers == 2
+    assert args.correction_num_heads == 6
+    assert args.correction_gate_bias == -1.5
+    assert args.confidence_head_with_correction is False
+
+
+def test_correction_options_are_rejected_for_native_dspark(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark",
+                "--correction-hidden-size",
+                "256",
+            ],
+        )
+
+
+def test_markov_options_are_rejected_for_correction_variant(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark_correction",
+                "--markov-rank",
+                "256",
+            ],
+        )
 
 
 # ---------------------------------------------------------------------------

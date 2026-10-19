@@ -19,6 +19,11 @@ Predicts all draft tokens in a single forward pass using block-based prediction 
 An isolated DSpark training variant that replaces the Markov head with a causal
 Correction Transformer while preserving the original `dspark` model.
 
+## [DSpark Correction Markov](dspark_correction_markov_development_plan.md)
+
+Implemented training variant that combines causal Correction with the native
+vanilla, gated, or RNN Markov head through an MMuse-style collaboration gate.
+
 ## [MTP](mtp.md)
 
 Finetunes the model's native multi-token prediction head on domain-specific data. Available for models with built-in MTP support (e.g. Qwen3-Next, Qwen3.5).

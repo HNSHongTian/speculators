@@ -46,7 +46,7 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 - **`--trust-remote-code`** (flag) Allow executing code from HF Hub when loading the verifier's tokenizer.
 
-- **`--speculator-type`** (str, default: `"eagle3"`) Type of speculator model to train. Options: `eagle3`, `dflash`, `dspark`, `dspark_correction`, `dspark_layerwise`, `dspark_deep`, `peagle`, `mtp`. `dspark_correction` keeps the DSpark backbone but replaces the Markov head with a causal correction head; `dspark_layerwise` adds DFlare-style per-draft-layer target fusion and heterogeneous target/draft KV projections; `dspark_deep` keeps the original DSpark backbone but requires a scaled draft depth.
+- **`--speculator-type`** (str, default: `"eagle3"`) Type of speculator model to train. Options: `eagle3`, `dflash`, `dspark`, `dspark_correction`, `dspark_correction_markov`, `dspark_layerwise`, `dspark_deep`, `peagle`, `mtp`. `dspark_correction` replaces the DSpark Markov head with causal Correction; `dspark_correction_markov` keeps the native Markov/RNN head and adds causal Correction plus a collaboration gate; `dspark_layerwise` adds DFlare-style per-draft-layer target fusion and heterogeneous target/draft KV projections; `dspark_deep` keeps the original DSpark backbone but requires a scaled draft depth.
 
 - **`--from-pretrained`** (str, default: `""`) Path or HF id of an existing draft checkpoint to load weights from and train — either a previously trained draft or the initialized-but-untrained checkpoint produced by `--dry-run`. May also point to a local directory containing only a `config.json`, in which case a fresh draft is initialized from that full speculator config. Takes precedence over all other model-definition options: it is mutually exclusive with `--draft-config` and the decoder-shaping flags (`--num-layers`, `--draft-arch`, `--draft-hidden-act`, `--sliding-window`, `--full-attention-indices`).
 
@@ -177,6 +177,34 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 - **`--sample-from-anchor`** / **`--no-sample-from-anchor`** (bool, default: algorithm-specific) Whether to sample from the anchor position. `True`: sample from anchor and all mask positions (default for dspark, produces block_size tokens). `False`: anchor is bonus token (default for dflash, produces block_size-1 tokens).
 
 - **`--max-anchors`** (int, default: `256`) Maximum anchor positions for DFlash training.
+
+### DSpark Correction-Markov Arguments
+
+- **`--markov-rank`** (int, default: `256`) Native DSpark Markov low-rank dimension. It must be greater than zero for `dspark_correction_markov`.
+
+- **`--markov-head-type`** (choice: `vanilla`|`gated`|`rnn`, default: `vanilla`) Native DSpark sequential head implementation.
+
+- **`--correction-output-mode`** (choice: `hidden`|`logits`, default: `hidden`) Apply the causal Correction residual before the LM head or directly in vocabulary-logit space.
+
+- **`--correction-hidden-size`** (int, default: `512`) Width of the causal Correction Transformer. Must be divisible by `--correction-num-heads`.
+
+- **`--correction-rank`** (int, default: `256`) Low-rank width of the Correction output projection.
+
+- **`--correction-num-layers`** (int, default: `1`) Number of causal Correction Transformer layers.
+
+- **`--correction-num-heads`** (int, default: `8`) Number of Correction attention heads.
+
+- **`--correction-gate-bias`** (float, default: `0.0`) Initial bias of the Correction residual gate.
+
+- **`--correction-markov-gate-bias`** (float, default: `-2.0`) Initial bias of the local MMuse-style collaboration gate.
+
+- **`--correction-markov-scale-init`** (float, default: `0.0`) Initial value before `tanh` for the global Markov residual scale. At zero, the initial combined logits are exactly the Correction logits.
+
+- **`--confidence-head-with-correction`** / **`--no-confidence-head-with-correction`** (bool, default: enabled) Include the causal Correction state in the DSpark confidence features.
+
+- **`--correction-hidden-aux-loss`** / **`--no-correction-hidden-aux-loss`** (bool, default: disabled) Add hidden-state alignment loss. Supported only with `--correction-output-mode hidden`.
+
+- **`--correction-hidden-aux-weight`** (float, default: `0.1`) Weight of hidden-state alignment loss.
 
 - **`--dflash-decay-gamma`** (float, default: `4.0`) Decay gamma for DFlash loss weighting.
 

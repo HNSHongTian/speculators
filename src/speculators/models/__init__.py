@@ -6,6 +6,10 @@ from .dspark_correction import (
     DSparkCorrectionDraftModel,
     DSparkCorrectionSpeculatorConfig,
 )
+from .dspark_correction_markov import (
+    DSparkCorrectionMarkovDraftModel,
+    DSparkCorrectionMarkovSpeculatorConfig,
+)
 from .dspark_deep import DSparkDeepDraftModel, DSparkDeepSpeculatorConfig
 from .dspark_layerwise import (
     DSparkLayerwiseDraftModel,
@@ -19,6 +23,8 @@ __all__ = [
     "DFlashDraftModel",
     "DFlashSpeculatorConfig",
     "DSparkCorrectionDraftModel",
+    "DSparkCorrectionMarkovDraftModel",
+    "DSparkCorrectionMarkovSpeculatorConfig",
     "DSparkCorrectionSpeculatorConfig",
     "DSparkDeepDraftModel",
     "DSparkDeepSpeculatorConfig",

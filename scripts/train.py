@@ -773,6 +773,11 @@ CORRECTION_FLAGS: dict[str, str] = {
     "correction_hidden_aux_weight": "--correction-hidden-aux-weight",
 }
 
+CORRECTION_MARKOV_FLAGS: dict[str, str] = {
+    "correction_markov_gate_bias": "--correction-markov-gate-bias",
+    "correction_markov_scale_init": "--correction-markov-scale-init",
+}
+
 MARKOV_FLAGS: dict[str, str] = {
     "markov_rank": "--markov-rank",
     "markov_head_type": "--markov-head-type",
@@ -840,23 +845,46 @@ def validate_dspark_correction_args(
     args: argparse.Namespace,
     correction_provided: set[str],
     markov_provided: set[str],
+    correction_markov_provided: set[str],
 ) -> None:
     """Keep Correction isolated from the original DSpark CLI contract."""
-    if args.speculator_type != "dspark_correction":
+    correction_types = {"dspark_correction", "dspark_correction_markov"}
+    if args.speculator_type not in correction_types:
         if correction_provided:
             flags = [CORRECTION_FLAGS[name] for name in sorted(correction_provided)]
             parser.error(
                 "Correction options require --speculator-type dspark_correction "
+                "or dspark_correction_markov "
                 f"(remove them or change the model type): {', '.join(flags)}"
+            )
+        if correction_markov_provided:
+            flags = [
+                CORRECTION_MARKOV_FLAGS[name]
+                for name in sorted(correction_markov_provided)
+            ]
+            parser.error(
+                "Correction-Markov options require "
+                "--speculator-type dspark_correction_markov: "
+                f"{', '.join(flags)}"
             )
         return
 
-    if markov_provided:
+    if args.speculator_type == "dspark_correction" and markov_provided:
         flags = [MARKOV_FLAGS[name] for name in sorted(markov_provided)]
         parser.error(
             "dspark_correction replaces the Markov head; remove these options: "
             f"{', '.join(flags)}"
         )
+    if args.speculator_type == "dspark_correction" and correction_markov_provided:
+        flags = [
+            CORRECTION_MARKOV_FLAGS[name] for name in sorted(correction_markov_provided)
+        ]
+        parser.error(
+            "dspark_correction does not include Markov collaboration; remove: "
+            f"{', '.join(flags)}"
+        )
+    if args.speculator_type == "dspark_correction_markov" and args.markov_rank <= 0:
+        parser.error("dspark_correction_markov requires --markov-rank > 0")
     if args.correction_hidden_aux_loss and args.correction_output_mode != "hidden":
         parser.error(
             "--correction-hidden-aux-loss requires --correction-output-mode hidden"
@@ -885,7 +913,8 @@ def parse_args():
         type=str,
         default="eagle3",
         help="Type of speculator model to train (eagle3, dflash, dspark, "
-        "dspark_correction, dspark_layerwise, dspark_deep, peagle, mtp)",
+        "dspark_correction, dspark_correction_markov, dspark_layerwise, "
+        "dspark_deep, peagle, mtp)",
     )
     parser.add_argument(
         "--from-pretrained",
@@ -1314,6 +1343,18 @@ def parse_args():
         help="DSpark Correction: hidden-alignment loss weight (default: 0.1).",
     )
     parser.add_argument(
+        "--correction-markov-gate-bias",
+        type=float,
+        default=-2.0,
+        help="DSpark Correction Markov: local collaboration-gate bias.",
+    )
+    parser.add_argument(
+        "--correction-markov-scale-init",
+        type=float,
+        default=0.0,
+        help="DSpark Correction Markov: initial pre-tanh global Markov scale.",
+    )
+    parser.add_argument(
         "--draft-attn-impl",
         type=str,
         default="simple_flex_attention",
@@ -1479,11 +1520,15 @@ def parse_args():
     validate_draft_init_args(parser, args, provided)
     correction_provided = explicitly_provided_dests(parser, CORRECTION_FLAGS)
     markov_provided = explicitly_provided_dests(parser, MARKOV_FLAGS)
+    correction_markov_provided = explicitly_provided_dests(
+        parser, CORRECTION_MARKOV_FLAGS
+    )
     validate_dspark_correction_args(
         parser,
         args,
         correction_provided,
         markov_provided,
+        correction_markov_provided,
     )
     resolve_loss_config(args.loss_fn)
 

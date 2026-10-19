@@ -220,6 +220,64 @@ def test_markov_options_are_rejected_for_correction_variant(monkeypatch):
         )
 
 
+def test_dspark_correction_markov_cli_options(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark_correction_markov",
+            "--markov-rank",
+            "128",
+            "--markov-head-type",
+            "rnn",
+            "--correction-output-mode",
+            "hidden",
+            "--correction-hidden-size",
+            "384",
+            "--correction-rank",
+            "96",
+            "--correction-num-heads",
+            "6",
+            "--correction-markov-gate-bias",
+            "-1.5",
+            "--correction-markov-scale-init",
+            "0.25",
+        ],
+    )
+    assert args.markov_rank == 128
+    assert args.markov_head_type == "rnn"
+    assert args.correction_hidden_size == 384
+    assert args.correction_rank == 96
+    assert args.correction_markov_gate_bias == -1.5
+    assert args.correction_markov_scale_init == 0.25
+
+
+def test_dspark_correction_markov_rejects_disabled_markov(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark_correction_markov",
+                "--markov-rank",
+                "0",
+            ],
+        )
+
+
+def test_collaboration_options_are_rejected_for_correction_only(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark_correction",
+                "--correction-markov-gate-bias",
+                "-1.0",
+            ],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
 # ---------------------------------------------------------------------------

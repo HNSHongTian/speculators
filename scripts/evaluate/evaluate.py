@@ -28,8 +28,9 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from perf_utils import (
     BASE_CSV_COLUMNS,
@@ -58,6 +59,7 @@ DEFAULT_MAX_REQUESTS = 200
 DEFAULT_GEN_LEN_RATE = 128
 DEFAULT_SWEEP_RATE = 10
 DEFAULT_DATA_COLUMN_MAPPER = '{"text_column":"prompt"}'
+DEFAULT_REQUEST_DETAILS_MAX_TOKENS = 4096
 
 # ---------------------------------------------------------------------------
 # SPEED-Bench constants
@@ -92,6 +94,215 @@ def _require_metrics(metrics_url: str) -> list:
         logger.error("Failed to fetch metrics from %s", metrics_url)
         sys.exit(1)
     return parse_prometheus_metrics(text)
+
+
+def _load_json_records(path: Path) -> list[dict[str, Any]]:
+    if path.suffix == ".jsonl":
+        with path.open() as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    with path.open() as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "records", "examples"):
+            if isinstance(data.get(key), list):
+                return data[key]
+    raise ValueError(f"{path}: expected a JSON array or JSONL records")
+
+
+def _detail_prompts(
+    dataset: str,
+    subset: str | None,
+    data_column_mapper: str,
+    max_requests: int | None,
+) -> list[str]:
+    """Load the exact text column used by GuideLLM for detail logging."""
+    try:
+        mapper = json.loads(data_column_mapper)
+        text_column = mapper["text_column"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise ValueError(
+            "--data-column-mapper must be JSON containing text_column"
+        ) from e
+
+    dataset_path = Path(dataset)
+    if dataset_path.is_file():
+        records = _load_json_records(dataset_path)
+    elif dataset_path.is_dir():
+        if subset is None:
+            raise ValueError(
+                f"{dataset_path}: a subset is required for a local dataset directory"
+            )
+        subset_path = dataset_path / f"{subset}.jsonl"
+        if not subset_path.exists():
+            raise FileNotFoundError(
+                f"Detail logging expected local subset file: {subset_path}"
+            )
+        records = _load_json_records(subset_path)
+    else:
+        from datasets import load_dataset  # noqa: PLC0415
+
+        data_files = f"{subset}.jsonl" if subset is not None else None
+        loaded = load_dataset(dataset, data_files=data_files, split="train")
+        records = loaded
+
+    prompts: list[str] = []
+    for index, record in enumerate(records):
+        if max_requests is not None and index >= max_requests:
+            break
+        value = record.get(text_column)
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{dataset}/{subset}: row {index} column {text_column!r} "
+                "must contain a string"
+            )
+        prompts.append(value)
+    return prompts
+
+
+def _chat_completion_url(target: str) -> str:
+    base = target.rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return f"{base}/chat/completions"
+
+
+def _request_completion(
+    target: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    gen_kwargs: str,
+) -> dict[str, Any]:
+    try:
+        body = json.loads(gen_kwargs) if gen_kwargs else {}
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in --gen-kwargs: {gen_kwargs!r}: {e}") from e
+    if not isinstance(body, dict):
+        raise ValueError("--gen-kwargs must be a flat JSON object")
+
+    body.update(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}],
+                }
+            ],
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+    )
+    request = Request(  # noqa: S310
+        _chat_completion_url(target),
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=3600) as response:  # noqa: S310
+            result = json.loads(response.read())
+    except HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        raise RuntimeError(
+            f"vLLM completion request failed ({e.code}): {detail}"
+        ) from e
+
+    choices = result.get("choices") or []
+    if not choices:
+        raise RuntimeError("vLLM completion response has no choices")
+    usage = result.get("usage") or {}
+    return {
+        "request_id": result.get("id"),
+        "output": choices[0].get("message", {}).get("content") or "",
+        "finish_reason": choices[0].get("finish_reason"),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+    }
+
+
+def _log_request_details(
+    *,
+    subset: str,
+    target: str,
+    dataset: str,
+    data_column_mapper: str,
+    metrics_url: str,
+    output_path: Path,
+    max_requests: int | None,
+    max_tokens: int,
+    gen_kwargs: str,
+) -> None:
+    """Run an exclusive serial pass and persist per-request DSpark metrics."""
+    model = _fetch_model_name(target)
+    if not model:
+        raise RuntimeError(f"Could not determine the served model from {target}")
+
+    local_dataset = Path(dataset)
+    prompt_subset = None if local_dataset.is_file() else subset
+    prompts = _detail_prompts(
+        dataset,
+        prompt_subset,
+        data_column_mapper,
+        max_requests,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "[%s] Request detail logging enabled: %d serial requests -> %s",
+        subset,
+        len(prompts),
+        output_path,
+    )
+    logger.warning(
+        "[%s] Per-request acceptance metrics require exclusive access to the vLLM "
+        "server during this serial pass",
+        subset,
+    )
+
+    with output_path.open("w") as output_file:
+        for index, prompt in enumerate(prompts):
+            baseline = _require_metrics(metrics_url)
+            completion = _request_completion(
+                target,
+                model,
+                prompt,
+                max_tokens,
+                gen_kwargs,
+            )
+            current = _require_metrics(metrics_url)
+            spec = extract_spec_decode_metrics(current, baseline_metrics=baseline)
+            drafts = spec.get("num_drafts", 0)
+            accepted = spec.get("num_accepted_tokens", 0)
+            accepted_per_draft = accepted / drafts if drafts > 0 else 0
+            record = {
+                "subset": subset,
+                "sample_index": index,
+                "prompt": prompt,
+                **completion,
+                "prompt_characters": len(prompt),
+                "output_characters": len(completion["output"]),
+                "num_drafts": drafts,
+                "num_draft_tokens": spec.get("num_draft_tokens", 0),
+                "num_accepted_tokens": accepted,
+                "accepted_tokens_per_draft": accepted_per_draft,
+                "dspark_acceptance_length": spec.get("acceptance_length", 0),
+            }
+            output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            output_file.flush()
+            logger.info(
+                "[%s][%d/%d] prompt_tokens=%s completion_tokens=%s "
+                "accepted_tokens_per_draft=%.4f dspark_acceptance_length=%.4f",
+                subset,
+                index + 1,
+                len(prompts),
+                completion["prompt_tokens"],
+                completion["completion_tokens"],
+                accepted_per_draft,
+                spec.get("acceptance_length", 0),
+            )
 
 
 def _resolve_speedbench(
@@ -222,7 +433,11 @@ def _run_subset(
             )
         acceptance_csv.append(spec)
     else:
-        logger.warning("[%s] No speculative decoding metrics found", subset)
+        logger.warning(
+            "[%s] No DSpark draft activity detected (num_drafts=0); "
+            "the inference service may be running without a DSpark draft model",
+            subset,
+        )
 
     if is_sweep:
         rows = parse_sweep_results(
@@ -309,6 +524,24 @@ def run_benchmark(args: argparse.Namespace) -> None:
         )
         if mt is not None:
             all_max_tokens[label] = mt
+        if getattr(args, "log_request_details", False):
+            safe = label.replace("/", "_").replace(" ", "_")
+            detail_max_tokens = mt or args.request_details_max_tokens
+            _log_request_details(
+                subset=label,
+                target=args.target,
+                dataset=common["dataset"],
+                data_column_mapper=common["data_column_mapper"],
+                metrics_url=metrics_url,
+                output_path=(
+                    output_dir
+                    / "request_details"
+                    / f"request_details_{safe}.jsonl"
+                ),
+                max_requests=args.max_requests,
+                max_tokens=detail_max_tokens,
+                gen_kwargs=args.gen_kwargs,
+            )
 
     if acceptance_csv is None:
         logger.error("No acceptance metrics collected from any subset")
@@ -409,6 +642,25 @@ def main() -> None:
         help=(
             "Path to directory produced by SPEED-Bench prepare.py. "
             "Required when --dataset is a speedbench/ spec."
+        ),
+    )
+    parser.add_argument(
+        "--log-request-details",
+        action="store_true",
+        help=(
+            "Run an additional serial pass and log each prompt length, generated "
+            "text length, generated text, and DSpark acceptance length to JSONL. "
+            "Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--request-details-max-tokens",
+        type=int,
+        default=DEFAULT_REQUEST_DETAILS_MAX_TOKENS,
+        help=(
+            "Maximum generated tokens in the serial detail pass for throughput "
+            f"mode (default: {DEFAULT_REQUEST_DETAILS_MAX_TOKENS}). Sweep mode "
+            "uses its estimated subset max_tokens."
         ),
     )
 

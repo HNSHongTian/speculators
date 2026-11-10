@@ -93,38 +93,13 @@ def _load_draft(
     args: argparse.Namespace,
     context: ExpertParallelContext,
 ):
-    from speculators.models.dspark.core import DSparkDraftModel
-
-    config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
-    config.transformer_layer_config._attn_implementation = args.draft_attn_impl
-
-    verifier = getattr(getattr(config, "speculators_config", None), "verifier", None)
-    if verifier is not None:
-        verifier.name_or_path = str(args.verifier_model)
-
-    sample_from_anchor = legacy._parse_bool_override(args.sample_from_anchor)
-    if sample_from_anchor is not None:
-        config.sample_from_anchor = sample_from_anchor
-
-    d2t, t2d = legacy._load_vocab_mapping_tensors(
-        draft_model_path=args.draft_model,
-        d2t_path=args.d2t_path,
-        t2d_path=args.t2d_path,
-    )
-    model = DSparkDraftModel.from_pretrained(
-        args.draft_model,
-        config=config,
-        d2t=d2t,
-        t2d=t2d,
-    )
-    model = model.to(context.device).eval()
+    model = legacy.load_dspark_draft(args, context.device)
     patch_count = install_draft_attention_cat_compatibility(model)
     if context.is_primary:
         LOGGER.info(
             "Installed NPU-safe K/V concatenation on %d draft attention layers",
             patch_count,
         )
-    legacy._ensure_loaded_vocab_mappings(model, args)
     return model
 
 
@@ -142,11 +117,17 @@ def _prepare_legacy_args(
     return args
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace) -> None:  # noqa: C901
+    block_verification = bool(getattr(args, "block_verification", False))
     if args.tree_top_k < 1:
         raise ValueError("--tree-top-k must be >= 1")
     if args.tree_max_nodes < 1:
         raise ValueError("--tree-max-nodes must be >= 1")
+    if args.tree_top_k > 1 and block_verification:
+        raise ValueError(
+            "--block-verification supports linear DSpark only; use "
+            "--tree-top-k 1"
+        )
     if args.temperature != 0:
         raise ValueError(
             "Pure EP evaluation currently requires --temperature 0 so every "
@@ -221,8 +202,16 @@ def run(args: argparse.Namespace) -> None:
         )
         if context.is_primary:
             LOGGER.info(
-                "DSpark proposal mode: %s (tree_top_k=%d, tree_max_nodes=%d)",
+                "DSpark proposal mode: %s; verification=%s "
+                "(tree_top_k=%d, tree_max_nodes=%d)",
                 "tree" if runner.tree_enabled else "chain",
+                (
+                    "tree"
+                    if runner.tree_enabled
+                    else "block"
+                    if runner.block_verification
+                    else "token"
+                ),
                 runner.tree_top_k,
                 runner.tree_max_nodes,
             )
@@ -285,6 +274,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--block-verification",
+        action="store_true",
+        help=(
+            "Use lossless block verification for linear DSpark. When unset, "
+            "keep the default token-by-token verification."
+        ),
+    )
     parser.add_argument(
         "--tree-top-k",
         type=int,

@@ -1,6 +1,7 @@
 import argparse
 import gc
 import logging
+import math
 import random
 import warnings
 from copy import deepcopy
@@ -20,6 +21,11 @@ from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
 )
 from speculators.model import SpeculatorModel
+from speculators.models.draft_config import transformer_config_from_dict
+from speculators.models.dspark.loss_config import (
+    parse_loss_weight_schedule,
+    resolve_dspark_loss_config,
+)
 from speculators.models.eagle3.data import shift_batch
 from speculators.models.eagle3.rotary_partial import install_partial_neox_rotary
 from speculators.models.metrics import resolve_loss_config
@@ -131,7 +137,7 @@ def _resolve_draft_head_dim(
     return None
 
 
-def create_transformer_layer_config(  # noqa: C901
+def create_transformer_layer_config(  # noqa: C901, PLR0917
     verifier_name_or_path: str,
     num_layers: int,
     draft_arch: str,
@@ -291,6 +297,8 @@ def create_transformer_layer_config(  # noqa: C901
 def load_draft_transformer_layer_config(
     draft_config: str,
     verifier_name_or_path: str,
+    *,
+    trust_remote_code: bool = False,
 ) -> PretrainedConfig:
     """Load the draft decoder ``transformer_layer_config`` from a config source.
 
@@ -317,10 +325,11 @@ def load_draft_transformer_layer_config(
             "eagle3/peagle, 'qwen3' for dflash); none was found in the config "
             f"loaded from '{draft_config}'."
         )
-    config_class: type[PretrainedConfig] = type(AutoConfig.for_model(model_type))
-    draft_config_obj = config_class.from_dict(config_dict)
+    draft_config_obj = transformer_config_from_dict(config_dict)
 
-    verifier_config = get_verifier_config(verifier_name_or_path)
+    verifier_config = get_verifier_config(
+        verifier_name_or_path, trust_remote_code=trust_remote_code
+    )
     if draft_config_obj.hidden_size != verifier_config.hidden_size:
         raise ValueError(
             f"--draft-config hidden_size ({draft_config_obj.hidden_size}) must match "
@@ -416,7 +425,7 @@ def parse_vocab_mappings(args: argparse.Namespace):
     return None, None, verifier_vocab_size
 
 
-def _build_from_config_only(
+def _build_from_config_only(  # noqa: PLR0917
     model_class: type[SpeculatorModel],
     path: str,
     t2d: torch.Tensor | None,
@@ -519,7 +528,9 @@ def build_draft_model(
     else:
         if args.draft_config:
             transformer_layer_config = load_draft_transformer_layer_config(
-                args.draft_config, args.verifier_name_or_path
+                args.draft_config,
+                args.verifier_name_or_path,
+                trust_remote_code=args.trust_remote_code,
             )
         else:
             full_attention_indices = args.full_attention_indices
@@ -636,6 +647,23 @@ def main(args: argparse.Namespace):  # noqa: C901
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
 
+    # Record the exact TreeSpark replay policy in every DSpark checkpoint,
+    # including --from-pretrained runs where the CLI intentionally overrides
+    # the policy stored by the source checkpoint.
+    if args.speculator_type == "dspark":
+        for config_name, arg_name in (
+            ("tree_training_enabled", "enable_tree_training"),
+            ("tree_loss_top_k", "tree_loss_top_k"),
+            ("tree_loss_num_anchors", "tree_loss_num_anchors"),
+            ("tree_loss_max_nodes", "tree_loss_max_nodes"),
+            ("tree_rank_margin", "tree_rank_margin"),
+            ("tree_rank_hinge_cap", "tree_rank_hinge_cap"),
+            ("tree_rank_top_j", "tree_rank_top_j"),
+            ("tree_survival_alpha", "tree_survival_alpha"),
+            ("tree_rank_alpha", "tree_rank_alpha"),
+        ):
+            setattr(draft_model.config, config_name, getattr(args, arg_name))
+
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]
 
@@ -664,6 +692,38 @@ def main(args: argparse.Namespace):  # noqa: C901
         return
 
     hidden_size = draft_model.config.transformer_layer_config.hidden_size
+    if args.enable_bv_loss:
+        if draft_model.use_draft_vocab:
+            raise ValueError("--enable-bv-loss requires the full verifier vocabulary")
+        _, bv_weight, ce_weight, tv_weight = resolve_dspark_loss_config(
+            args.loss_fn, enable_bv_loss=True
+        )
+        logger.info(
+            "effective_main_loss=%s*bv_integrated_log + %s*ce + %s*tv; "
+            "loss_weight_schedule=%s; --loss-fn=%s; BV has no position decay; "
+            "CE/TV use gamma=%s; anneal_epochs=%s; chunk_size=%s",
+            bv_weight,
+            ce_weight,
+            tv_weight,
+            args.loss_weight_schedule,
+            args.loss_fn,
+            args.dflash_decay_gamma,
+            args.bv_anneal_epochs,
+            args.bv_chunk_size,
+        )
+    if args.enable_tree_training:
+        logger.info(
+            "TreeSpark training enabled: top_k=%d max_nodes=%d tree_anchors=%d "
+            "top_j=%d margin=%s hinge_cap=%s survival_alpha=%s coverage_alpha=%s",
+            args.tree_loss_top_k,
+            args.tree_loss_max_nodes,
+            args.tree_loss_num_anchors,
+            args.tree_rank_top_j,
+            args.tree_rank_margin,
+            args.tree_rank_hinge_cap,
+            args.tree_survival_alpha,
+            args.tree_rank_alpha,
+        )
 
     # Setup dataloaders
     preprocess_fns = {
@@ -725,6 +785,29 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        bv_anneal_epochs=args.bv_anneal_epochs,
+        loss_weight_schedule=args.loss_weight_schedule,
+        bv_recipe=(
+            {
+                "data_path": str(Path(args.data_path).resolve()),
+                "total_seq_len": args.total_seq_len,
+                "train_data_ratio": args.train_data_ratio,
+                "seed": args.seed,
+                "max_anchors": args.max_anchors,
+                "noise_std": args.noise_std,
+                "block_size": draft_model.block_size,
+                "sample_from_anchor": draft_model.config.sample_from_anchor,
+                "enable_confidence_head": draft_model.config.enable_confidence_head,
+                "confidence_head_alpha": args.confidence_head_alpha,
+                "verifier_name_or_path": args.verifier_name_or_path,
+                "markov_rank": draft_model.config.markov_rank,
+                "markov_head_type": draft_model.config.markov_head_type,
+                "target_layer_ids": draft_model.target_layer_ids,
+                "mask_token_id": draft_model.mask_token_id,
+            }
+            if args.enable_bv_loss
+            else None
+        ),
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -759,6 +842,12 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
     "draft_hidden_act": "--draft-hidden-act",
     "sliding_window": "--sliding-window",
     "full_attention_indices": "--full-attention-indices",
+    "draft_use_mla": "--draft-use-mla",
+    "mla_kv_lora_rank": "--mla-kv-lora-rank",
+    "mla_q_lora_rank": "--mla-q-lora-rank",
+    "mla_qk_nope_head_dim": "--mla-qk-nope-head-dim",
+    "mla_qk_rope_head_dim": "--mla-qk-rope-head-dim",
+    "mla_v_head_dim": "--mla-v-head-dim",
 }
 
 
@@ -817,8 +906,172 @@ def validate_draft_init_args(
         )
 
 
+def validate_mla_args(parser: argparse.ArgumentParser, args: argparse.Namespace):
+    """Fail before loading verifier weights for invalid opt-in MLA options."""
+    dimensions = {
+        name: getattr(args, name)
+        for name in DECODER_SHAPING_FLAGS
+        if name.startswith("mla_")
+    }
+    if not args.draft_use_mla:
+        if any(value is not None for value in dimensions.values()):
+            parser.error("--mla-* dimensions require --draft-use-mla")
+        return
+    if args.draft_arch != "qwen3" or args.speculator_type not in (
+        "dflash",
+        "dspark",
+        "eagle3",
+        "peagle",
+    ):
+        parser.error(
+            "--draft-use-mla requires a qwen3 dflash/dspark/eagle3/peagle draft"
+        )
+    if any(value is not None and value <= 0 for value in dimensions.values()):
+        parser.error("--mla-* dimensions must be positive integers")
+    if args.mla_qk_rope_head_dim is not None and args.mla_qk_rope_head_dim % 2:
+        parser.error("--mla-qk-rope-head-dim must be even")
+
+
+def validate_bv_args(parser: argparse.ArgumentParser, args: argparse.Namespace):
+    """Validate only the opt-in BV path; legacy CLI defaults are unchanged."""
+    if args.enable_bv_loss:
+        _, _, ce_weight, tv_weight = resolve_dspark_loss_config(
+            args.loss_fn, enable_bv_loss=True
+        )
+        scheduled_token_loss = args.loss_weight_schedule is not None and any(
+            point["ce"] > 0 or point["tv"] > 0 for point in args.loss_weight_schedule
+        )
+        if (ce_weight > 0 or tv_weight > 0 or scheduled_token_loss) and (
+            not math.isfinite(args.dflash_decay_gamma) or args.dflash_decay_gamma <= 0
+        ):
+            parser.error("BV+CE/TV requires finite positive --dflash-decay-gamma")
+        if (
+            args.loss_weight_schedule is not None
+            and any(
+                point.get("confidence", 0) > 0 for point in args.loss_weight_schedule
+            )
+            and not args.enable_confidence_head
+        ):
+            parser.error(
+                "A positive scheduled confidence weight requires "
+                "--enable-confidence-head"
+            )
+        if args.speculator_type != "dspark":
+            parser.error("--enable-bv-loss requires --speculator-type dspark")
+        if args.per_position_loss_weight == "dpace":
+            parser.error("--enable-bv-loss cannot use --per-position-loss-weight dpace")
+        if not math.isfinite(args.bv_anneal_epochs) or args.bv_anneal_epochs < 0:
+            parser.error("--bv-anneal-epochs must be finite and nonnegative")
+        if args.bv_chunk_size < 1:
+            parser.error("--bv-chunk-size must be positive")
+        if args.max_anchors < 1:
+            parser.error("BV requires --max-anchors to be positive")
+        start = int(args.sample_from_anchor is False)
+        if args.block_size <= start:
+            parser.error("BV requires at least one prediction per block")
+
+
+def validate_tree_training_args(  # noqa: C901
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+):
+    """Validate the opt-in TreeSpark replay and loss configuration."""
+    if not args.enable_tree_training:
+        return
+    if args.speculator_type != "dspark":
+        parser.error("--enable-tree-training requires --speculator-type dspark")
+    if args.enable_bv_loss:
+        parser.error(
+            "--enable-tree-training cannot currently be combined with "
+            "--enable-bv-loss because BV applies a different distributed loss scaling"
+        )
+    if args.tree_loss_top_k < 2:  # noqa: PLR2004
+        parser.error("--tree-loss-top-k must be at least 2")
+    if args.tree_loss_num_anchors < 1:
+        parser.error("--tree-loss-num-anchors must be positive")
+    if args.tree_loss_num_anchors > args.max_anchors:
+        parser.error("--tree-loss-num-anchors cannot exceed --max-anchors")
+    if args.tree_loss_max_nodes < 1:
+        parser.error("--tree-loss-max-nodes must be positive")
+    if args.tree_rank_top_j < 1:
+        parser.error("--tree-rank-top-j must be positive")
+    for name in (
+        "tree_rank_margin",
+        "tree_rank_hinge_cap",
+        "tree_survival_alpha",
+        "tree_rank_alpha",
+    ):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    if args.tree_rank_margin == 0:
+        parser.error("--tree-rank-margin must be positive")
+    if args.tree_survival_alpha == 0 and args.tree_rank_alpha == 0:
+        parser.error(
+            "Tree training requires a positive --tree-survival-alpha or "
+            "--tree-rank-alpha"
+        )
+    first_draft_slot = int(args.sample_from_anchor is False)
+    if args.block_size <= first_draft_slot:
+        parser.error("Tree training requires at least one proposed draft depth")
+
+
+def validate_training_loss_config(parser, args):
+    try:
+        args.loss_weight_schedule = parse_loss_weight_schedule(
+            args.loss_weight_schedule, num_epochs=args.epochs
+        )
+        if args.loss_weight_schedule is not None and not args.enable_bv_loss:
+            parser.error("--loss-weight-schedule requires --enable-bv-loss")
+        if not args.enable_bv_loss:
+            resolve_loss_config(args.loss_fn)
+            return
+        resolve_dspark_loss_config(args.loss_fn, enable_bv_loss=True)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--draft-use-mla",
+        "--use-mla",
+        action="store_true",
+        help="Enable MLA for Qwen3 draft attention (default: original attention). "
+        "Saved in transformer_layer_config.use_mla. For --draft-config or "
+        "--from-pretrained, set MLA fields in the saved config instead.",
+    )
+    parser.add_argument(
+        "--mla-kv-lora-rank",
+        type=int,
+        default=None,
+        help="Shared KV latent rank (default: min(512, hidden_size // 4)).",
+    )
+    parser.add_argument(
+        "--mla-q-lora-rank",
+        type=int,
+        default=None,
+        help="Optional query latent rank (default: direct query projection).",
+    )
+    parser.add_argument(
+        "--mla-qk-nope-head-dim",
+        type=int,
+        default=None,
+        help="Per-head content Q/K width "
+        "(default: head_dim minus the default RoPE width).",
+    )
+    parser.add_argument(
+        "--mla-qk-rope-head-dim",
+        type=int,
+        default=None,
+        help="Even decoupled RoPE width "
+        "(default: half head_dim, rounded down to even).",
+    )
+    parser.add_argument(
+        "--mla-v-head-dim",
+        type=int,
+        default=None,
+        help="Per-head value width (default: head_dim).",
+    )
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
     parser.add_argument(
         "--trust-remote-code",
@@ -1173,6 +1426,30 @@ def parse_args():
     )
     # DSpark-specific arguments (sequential Markov head + confidence head).
     parser.add_argument(
+        "--enable-bv-loss",
+        action="store_true",
+        help="DSpark: enable integrated log BV. Use --loss-fn bv or a JSON dict "
+        'such as \'{"bv":0.2,"ce":0.08,"tv":0.72}\' for fixed weights. Legacy specs '
+        "without 'bv' are still overridden by pure BV. Requires full vocabulary.",
+    )
+    parser.add_argument(
+        "--loss-weight-schedule",
+        type=str,
+        default=None,
+        help=(
+            "DSpark BV mode: JSON epoch milestones overriding fixed BV/CE/TV weights. "
+            "Each item requires zero-based epoch,bv,ce,tv; optional confidence must "
+            "appear in every item. A milestone remains active until the next one."
+        ),
+    )
+    parser.add_argument("--bv-anneal-epochs", type=float, default=3.0)
+    parser.add_argument(
+        "--bv-chunk-size",
+        type=int,
+        default=16,
+        help="BV blocks per recomputed loss chunk (does not change the objective).",
+    )
+    parser.add_argument(
         "--markov-rank",
         type=int,
         default=256,
@@ -1203,6 +1480,68 @@ def parse_args():
         type=float,
         default=1.0,
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
+    )
+    parser.add_argument(
+        "--enable-tree-training",
+        action="store_true",
+        help=(
+            "DSpark: replay the deployed TreeSpark proposal policy during training "
+            "and add survival/coverage supervision. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--tree-loss-top-k",
+        type=int,
+        default=4,
+        help="TreeSpark per-parent branching factor and frontier width (default: 4).",
+    )
+    parser.add_argument(
+        "--tree-loss-num-anchors",
+        type=int,
+        default=128,
+        help="Maximum anchors replayed by tree losses per sequence (default: 128).",
+    )
+    parser.add_argument(
+        "--tree-loss-max-nodes",
+        type=int,
+        default=32,
+        help="TreeSpark global non-root verification budget (default: 32).",
+    )
+    parser.add_argument(
+        "--tree-rank-margin",
+        type=float,
+        default=1.0,
+        help="Coverage hinge margin in logit units (default: 1.0).",
+    )
+    parser.add_argument(
+        "--tree-rank-hinge-cap",
+        type=float,
+        default=4.0,
+        help="Coverage hinge cap; 0 disables capping (default: 4.0).",
+    )
+    parser.add_argument(
+        "--tree-rank-top-j",
+        type=int,
+        default=4,
+        help="Number of teacher top tokens supervised by coverage (default: 4).",
+    )
+    parser.add_argument(
+        "--tree-survival-alpha",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight of packed-edge survival NLL (default: 0.1; matches the "
+            "TreeSpark-main Qwen3-4B recipe)."
+        ),
+    )
+    parser.add_argument(
+        "--tree-rank-alpha",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight of frontier coverage loss (default: 0.1; matches the "
+            "TreeSpark-main Qwen3-4B recipe)."
+        ),
     )
     parser.add_argument(
         "--draft-attn-impl",
@@ -1368,7 +1707,11 @@ def parse_args():
 
     provided = explicitly_provided_dests(parser, DECODER_SHAPING_FLAGS)
     validate_draft_init_args(parser, args, provided)
-    resolve_loss_config(args.loss_fn)
+    validate_mla_args(parser, args)
+    validate_training_loss_config(parser, args)
+
+    validate_bv_args(parser, args)
+    validate_tree_training_args(parser, args)
 
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":

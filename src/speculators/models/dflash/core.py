@@ -21,6 +21,11 @@ from speculators.models.dflash.utils import (
     select_anchors,
 )
 from speculators.models.metrics import LossConfig, resolve_loss_config
+from speculators.models.mla import (
+    all_layers_use_mla,
+    configure_mla,
+    mla_rotary_config,
+)
 from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self._init_vocab(config)
 
         tl_config = config.transformer_layer_config
+        configure_mla(tl_config)
 
         # Number of draft layers is encoded in transformer_layer_config
         num_draft_layers = tl_config.num_hidden_layers
@@ -95,7 +101,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
+        rotary_config = (
+            mla_rotary_config(tl_config) if all_layers_use_mla(tl_config) else tl_config
+        )
+        self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
@@ -183,6 +192,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             GreedyTokenProposalConfig,
         )
 
+        configure_mla(verifier_config, **kwargs)
         target_layer_ids = resolve_target_layer_ids(
             kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
         )
@@ -261,7 +271,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         return self.config.mask_token_id
 
     @torch.compiler.disable
-    def _create_attention_mask(
+    def _create_attention_mask(  # noqa: PLR0917
         self,
         document_ids: torch.Tensor,
         total_seq_len: int,
@@ -318,7 +328,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
-    def _backbone_forward(
+    def _backbone_forward(  # noqa: PLR0917
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
         input_ids: torch.Tensor,  # [1, total_seq_len]
@@ -337,6 +347,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
         num_anchors = kwargs.pop("max_anchors", 3072)
+        anchor_selection_mask = kwargs.pop("anchor_selection_mask", None)
+        if anchor_selection_mask is None:
+            anchor_selection_mask = loss_mask
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -344,7 +357,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ).unsqueeze(0)
 
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
+            self._build_attention_mask(
+                anchor_selection_mask,
+                num_anchors,
+                document_ids,
+                device,
+            )
         )
 
         mask_tokens_size = num_anchors * self.block_size
@@ -422,7 +440,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
     @conditional_torch_compile
-    def forward(
+    def forward(  # noqa: PLR0917
         self,
         hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
         input_ids: torch.Tensor,  # shape: [1, total_seq_len]

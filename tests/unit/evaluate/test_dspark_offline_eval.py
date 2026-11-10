@@ -242,6 +242,35 @@ def test_runner_accepts_upstream_dspark_without_extension_heads():
     )
 
     assert runner.max_proposal_tokens == 4
+    assert not runner.block_verification
+
+
+def test_block_verification_is_opt_in(monkeypatch, tmp_path: Path):
+    module = _load_module()
+    required = [
+        "dspark_offline_eval.py",
+        "--verifier-model",
+        "target",
+        "--draft-model",
+        "draft",
+        "--datasets-root",
+        str(tmp_path),
+    ]
+
+    monkeypatch.setattr(sys, "argv", required)
+    assert not module.parse_args().block_verification
+
+    monkeypatch.setattr(sys, "argv", [*required, "--block-verification"])
+    enabled = module.parse_args()
+    assert enabled.block_verification
+    worker_command = module._worker_command(
+        enabled,
+        dataset_path=tmp_path / "gsm8k.jsonl",
+        shard_index=0,
+        num_shards=2,
+        output_dir=tmp_path / "worker",
+    )
+    assert worker_command.count("--block-verification") == 1
 
 
 def test_upstream_rnn_markov_rollout_replays_generated_prefix(monkeypatch):
@@ -572,6 +601,111 @@ def test_stop_token_truncates_probability_stats_with_effective_proposal():
     assert result.effective_proposal_length == 2
     assert result.accept_probs.shape == (1, 2)
     assert result.support_accept_rates.shape == (1, 2)
+
+
+def test_block_verification_can_accept_longer_prefix_after_shorter_failure(
+    monkeypatch,
+):
+    module = _load_module()
+
+    class TargetModel:
+        @staticmethod
+        def __call__(**_kwargs):
+            probabilities = torch.tensor([1.0 / 3.0, 2.0 / 3.0])
+            return SimpleNamespace(logits=probabilities.log().repeat(1, 3, 1))
+
+    draft_probs = torch.tensor([2.0 / 3.0, 1.0 / 3.0]).repeat(1, 2, 1)
+    proposal = module.DraftProposal(
+        draft_token_count=2,
+        verify_input_ids=torch.tensor([[1, 0, 0]]),
+        draft_probs=draft_probs,
+    )
+    # For the paper's AA toy block, h_1=0 and h_2=1/4. The first
+    # prefix fails while the second passes, so block verification keeps both.
+    monkeypatch.setattr(
+        module.torch,
+        "rand_like",
+        lambda _values: torch.tensor([[0.75, 0.10]]),
+    )
+
+    result = module.verify_draft_block(
+        target_model=TargetModel(),
+        proposal=proposal,
+        position_ids=torch.arange(3).unsqueeze(0),
+        start=0,
+        past_key_values_target=None,
+        temperature=1.0,
+        max_proposal_tokens=2,
+        current_token_ids=torch.tensor([[1]]),
+    )
+
+    assert result.accept_probs[0].tolist() == pytest.approx([0.0, 0.25])
+    assert result.accepted_draft_tokens == 2
+    assert torch.equal(result.accept_prefix_mask, torch.tensor([[1, 1]]))
+    assert torch.equal(result.committed_tokens[:, :2], torch.tensor([[0, 0]]))
+
+
+def test_block_verification_uses_scaled_residual_distribution(monkeypatch):
+    module = _load_module()
+    sampled = []
+
+    def capture_sample(probs):
+        sampled.append(probs)
+        return probs.argmax(dim=-1)
+
+    monkeypatch.setattr(module, "sample_from_probs", capture_sample)
+    result = module.sample_block_residual(
+        target_probs=torch.tensor([[0.8, 0.2]]),
+        draft_probs=torch.tensor([[0.2, 0.8]]),
+        prefix_probability=torch.tensor([0.5]),
+    )
+
+    assert torch.equal(result, torch.tensor([0]))
+    assert sampled[0][0].tolist() == pytest.approx([1.0, 0.0])
+
+
+def test_block_verification_accepts_identical_distributions():
+    module = _load_module()
+    draft_probs = torch.tensor(
+        [[[0.25, 0.75], [0.60, 0.40]]],
+        dtype=torch.float32,
+    )
+    target_probs = torch.cat(
+        [draft_probs, torch.tensor([[[0.30, 0.70]]])],
+        dim=1,
+    )
+
+    prefix_states, coin_probs = module.block_verification_probabilities(
+        target_probs,
+        draft_probs,
+        proposed_tokens=torch.tensor([[1, 0]]),
+    )
+
+    assert prefix_states[0].tolist() == pytest.approx([1.0, 1.0])
+    assert coin_probs[0].tolist() == pytest.approx([1.0, 1.0])
+
+
+def test_block_verification_rejects_tree_mode():
+    module = _load_module()
+    target = module.torch.nn.Linear(1, 1)
+    draft = SimpleNamespace(
+        block_size=4,
+        config=SimpleNamespace(sample_from_anchor=True),
+        use_draft_vocab=False,
+    )
+
+    with pytest.raises(ValueError, match="linear DSpark only"):
+        module.DSparkOfflineRunner(
+            target,
+            draft,
+            tokenizer=None,
+            args=SimpleNamespace(
+                tree_top_k=2,
+                tree_max_nodes=8,
+                block_verification=True,
+                temperature=0.0,
+            ),
+        )
 
 
 def test_detects_preprojection_correction():

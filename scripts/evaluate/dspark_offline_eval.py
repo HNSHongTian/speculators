@@ -310,6 +310,20 @@ def sample_residual(target_probs, draft_probs):
     return sample_from_probs(residual)
 
 
+def sample_block_residual(target_probs, draft_probs, prefix_probability):
+    """Sample Algorithm 2's scaled correction distribution.
+
+    ``prefix_probability`` is p_tau in Block Verification (Sun et al., 2025).
+    The fallback is only for a numerically degenerate zero residual; valid
+    rejection events have positive residual mass.
+    """
+    scale = prefix_probability.to(dtype=target_probs.dtype).reshape(-1, 1)
+    residual = (scale * target_probs - draft_probs).clamp_min(0)
+    denom = residual.sum(dim=-1, keepdim=True)
+    residual = torch.where(denom > 0, residual / denom.clamp_min(1e-8), target_probs)
+    return sample_from_probs(residual)
+
+
 def has_stop_token(token_ids, stop_token_ids: list[int] | None) -> bool:
     if stop_token_ids is None:
         return False
@@ -984,6 +998,196 @@ def verify_draft_tokens(
     )
 
 
+def block_verification_probabilities(target_probs, draft_probs, proposed_tokens):
+    """Return Algorithm 2 prefix states p_i and independent coin rates h_i.
+
+    Target probabilities contain one extra bonus position. Draft probabilities
+    contain the distributions that produced each proposed token. The evaluator
+    currently decodes one request at a time, but this calculation is batched.
+    """
+    draft_token_count = int(proposed_tokens.shape[1])
+    if target_probs.shape[1] != draft_token_count + 1:
+        raise ValueError("Block verification requires one target bonus position")
+    if draft_probs.shape[:2] != proposed_tokens.shape:
+        raise ValueError("Block verification draft probabilities do not match tokens")
+    if target_probs.shape[-1] != draft_probs.shape[-1]:
+        raise ValueError("Block verification target/draft vocabularies do not match")
+    if draft_token_count == 0:
+        empty = target_probs.new_empty(target_probs.shape[0], 0)
+        return empty, empty
+
+    selected_target = gather_token_probs(
+        target_probs[:, :draft_token_count, :], proposed_tokens
+    ).float()
+    selected_draft = gather_token_probs(draft_probs, proposed_tokens).float()
+    if bool((selected_draft <= 0).any().item()):
+        raise ValueError(
+            "Block verification requires positive draft probability for every "
+            "sampled token"
+        )
+
+    prefix_states = []
+    state = torch.ones(
+        selected_target.shape[0],
+        dtype=torch.float32,
+        device=selected_target.device,
+    )
+    for position in range(draft_token_count):
+        state = torch.minimum(
+            state * selected_target[:, position] / selected_draft[:, position],
+            torch.ones_like(state),
+        )
+        prefix_states.append(state)
+    prefix_states = torch.stack(prefix_states, dim=1)
+
+    coin_probs = torch.empty_like(prefix_states)
+    for position in range(draft_token_count - 1):
+        prefix_state = prefix_states[:, position]
+        residual_mass = (
+            prefix_state[:, None] * target_probs[:, position + 1, :].float()
+            - draft_probs[:, position + 1, :].float()
+        ).clamp_min(0).sum(dim=-1)
+        denominator = residual_mass + 1.0 - prefix_state
+        # If p_i=1 and the two next-token distributions are identical, Eq. (5)
+        # is 0/0. The prefix is losslessly accepted with probability one.
+        coin_probs[:, position] = torch.where(
+            denominator > 0,
+            residual_mass / denominator.clamp_min(torch.finfo(torch.float32).tiny),
+            torch.ones_like(denominator),
+        )
+    coin_probs[:, -1] = prefix_states[:, -1]
+    return prefix_states.to(target_probs.dtype), coin_probs.to(target_probs.dtype)
+
+
+def verify_draft_block(  # noqa: C901
+    *,
+    target_model,
+    proposal: DraftProposal,
+    position_ids,
+    start: int,
+    past_key_values_target,
+    temperature: float,
+    max_proposal_tokens: int,
+    current_token_ids=None,
+    stop_token_ids: list[int] | None = None,
+) -> VerificationResult:
+    """Losslessly verify a linear draft with block-level rejection sampling."""
+    if proposal.tree is not None:
+        raise ValueError("Block verification supports linear proposals only")
+    if proposal.draft_token_count > max_proposal_tokens:
+        raise ValueError("DraftProposal.draft_token_count exceeds max_proposal_tokens")
+    if current_token_ids is not None and not torch.equal(
+        proposal.verify_input_ids[:, :1], current_token_ids
+    ):
+        raise ValueError(
+            "DraftProposal.verify_input_ids must start with current token."
+        )
+
+    draft_token_count = int(proposal.draft_token_count)
+    verify_length = draft_token_count + 1
+    target_output = target_model(
+        input_ids=proposal.verify_input_ids,
+        position_ids=position_ids[:, start : start + verify_length],
+        past_key_values=past_key_values_target,
+        use_cache=True,
+        output_hidden_states=True,
+    )
+    target_probs = logits_to_probs(target_output.logits, float(temperature))
+
+    accept_prefix_mask = None
+    accept_probs = None
+    support_accept_rates = None
+    prefix_states = target_probs.new_empty(target_probs.shape[0], 0)
+    if draft_token_count > 0:
+        if proposal.draft_probs is None:
+            raise ValueError("draft_probs is required when draft_token_count > 0")
+        proposed_tokens = proposal.verify_input_ids[:, 1:]
+        prefix_states, accept_probs = block_verification_probabilities(
+            target_probs,
+            proposal.draft_probs,
+            proposed_tokens,
+        )
+        support_accept_rates = torch.minimum(
+            proposal.draft_probs[:, :draft_token_count, :],
+            target_probs[:, :draft_token_count, :],
+        ).sum(dim=-1)
+        accepted_prefixes = torch.rand_like(accept_probs) < accept_probs
+        accepted_indices = accepted_prefixes[0].nonzero(as_tuple=True)[0]
+        accepted_draft_tokens = (
+            int(accepted_indices[-1].item()) + 1
+            if accepted_indices.numel() > 0
+            else 0
+        )
+        positions = torch.arange(draft_token_count, device=target_probs.device)
+        accept_prefix_mask = (
+            positions[None, :] < accepted_draft_tokens
+        ).to(torch.int64)
+    else:
+        accepted_draft_tokens = 0
+
+    effective_proposal_length = draft_token_count
+    terminated_by_stop_token = False
+    if stop_token_ids and accepted_draft_tokens > 0:
+        accepted_slice = proposal.verify_input_ids[0, 1 : accepted_draft_tokens + 1]
+        stop_tensor = torch.tensor(
+            stop_token_ids,
+            device=accepted_slice.device,
+            dtype=accepted_slice.dtype,
+        )
+        eos_hits = torch.isin(accepted_slice, stop_tensor).nonzero(as_tuple=True)[0]
+        if eos_hits.numel() > 0:
+            accepted_draft_tokens = int(eos_hits[0].item()) + 1
+            effective_proposal_length = accepted_draft_tokens
+            terminated_by_stop_token = True
+
+    if effective_proposal_length < draft_token_count:
+        if accept_prefix_mask is not None:
+            accept_prefix_mask = accept_prefix_mask[:, :effective_proposal_length]
+        if accept_probs is not None:
+            accept_probs = accept_probs[:, :effective_proposal_length]
+        if support_accept_rates is not None:
+            support_accept_rates = support_accept_rates[:, :effective_proposal_length]
+
+    if terminated_by_stop_token:
+        # The correction token is not committed after EOS. Avoid consuming an
+        # additional random sample, while retaining the common result shape.
+        next_token = proposal.verify_input_ids[:, accepted_draft_tokens]
+    elif draft_token_count > 0 and accepted_draft_tokens < draft_token_count:
+        prefix_probability = (
+            target_probs.new_ones(target_probs.shape[0])
+            if accepted_draft_tokens == 0
+            else prefix_states[:, accepted_draft_tokens - 1]
+        )
+        next_token = sample_block_residual(
+            target_probs[:, accepted_draft_tokens, :],
+            proposal.draft_probs[:, accepted_draft_tokens, :],
+            prefix_probability,
+        )
+    else:
+        next_token = sample_from_probs(target_probs[:, -1:, :]).squeeze(1)
+
+    committed_tokens = torch.cat(
+        [
+            proposal.verify_input_ids[:, 1 : accepted_draft_tokens + 1],
+            next_token.unsqueeze(1),
+        ],
+        dim=1,
+    )
+    return VerificationResult(
+        target_output=target_output,
+        target_probs=target_probs,
+        accept_prefix_mask=accept_prefix_mask,
+        accept_probs=accept_probs,
+        support_accept_rates=support_accept_rates,
+        accepted_draft_tokens=accepted_draft_tokens,
+        next_token=next_token,
+        effective_proposal_length=effective_proposal_length,
+        terminated_by_stop_token=terminated_by_stop_token,
+        committed_tokens=committed_tokens,
+        position_proposal_length=effective_proposal_length,
+    )
+
+
 def build_tree_attention_mask(*, parent_indices, start: int, device):
     """Build the packed-tree mask used by the single target verification."""
     num_nodes = 1 + int(parent_indices.numel())
@@ -1386,12 +1590,18 @@ class DSparkOfflineRunner:
         self.tree_top_k = int(getattr(args, "tree_top_k", 1))
         self.tree_max_nodes = int(getattr(args, "tree_max_nodes", 32))
         self.tree_enabled = self.tree_top_k > 1
+        self.block_verification = bool(getattr(args, "block_verification", False))
         if self.tree_top_k < 1:
             raise ValueError("--tree-top-k must be >= 1")
         if self.tree_max_nodes < 1:
             raise ValueError("--tree-max-nodes must be >= 1")
         if self.tree_enabled and float(args.temperature) != 0.0:
             raise ValueError("Tree proposals require --temperature 0")
+        if self.tree_enabled and self.block_verification:
+            raise ValueError(
+                "--block-verification supports linear DSpark only; use "
+                "--tree-top-k 1"
+            )
         if (
             self.tree_enabled
             and getattr(draft_model, "correction_head", None) is not None
@@ -1837,7 +2047,13 @@ class DSparkOfflineRunner:
                 init_context=self._init_context,
                 propose=self._propose,
                 update=self._update,
-                verify=verify_draft_tree if self.tree_enabled else None,
+                verify=(
+                    verify_draft_tree
+                    if self.tree_enabled
+                    else verify_draft_block
+                    if self.block_verification
+                    else None
+                ),
             )
 
 
@@ -2245,6 +2461,8 @@ def _worker_command(
         cmd.append("--trust-remote-code")
     if args.sample_from_anchor is not None:
         cmd.extend(["--sample-from-anchor", str(args.sample_from_anchor).lower()])
+    if bool(getattr(args, "block_verification", False)):
+        cmd.append("--block-verification")
     if args.measure_base_speedup:
         cmd.extend(
             [
@@ -2334,14 +2552,78 @@ def _parse_bool_override(value: str | None) -> bool | None:
     raise ValueError(f"Expected boolean value, got {value}")
 
 
+def load_dspark_draft(args: argparse.Namespace, device=None):
+    """Restore saved GQA/MLA structure consistently for standalone and EP eval."""
+    import torch as torch_module  # noqa: PLC0415
+
+    from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
+    from speculators.models.mla import (  # noqa: PLC0415
+        Qwen3MLAAttention,
+        layer_uses_mla,
+    )
+
+    device = device if device is not None else args.device
+    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    # Training paths may not exist on the evaluation host. Use this run's target.
+    draft_config.speculators_config.verifier.name_or_path = str(args.verifier_model)
+    sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
+    if sample_from_anchor is not None:
+        draft_config.sample_from_anchor = sample_from_anchor
+    draft_attn_impl = _resolve_draft_attn_impl(str(device), args.draft_attn_impl)
+    if draft_attn_impl is not None:
+        draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
+    d2t, t2d = _load_vocab_mapping_tensors(
+        draft_model_path=args.draft_model,
+        d2t_path=args.d2t_path,
+        t2d_path=args.t2d_path,
+    )
+    dtype = getattr(torch_module, args.dtype) if args.dtype != "auto" else "auto"
+    draft_model = DSparkDraftModel.from_pretrained(
+        args.draft_model,
+        config=draft_config,
+        d2t=d2t,
+        t2d=t2d,
+        torch_dtype=dtype,
+    ).to(device).eval()
+    _ensure_loaded_vocab_mappings(draft_model, args)
+    layer_config = draft_config.transformer_layer_config
+    for index, layer in enumerate(draft_model.layers):
+        attention = layer.self_attn
+        is_mla = isinstance(attention, Qwen3MLAAttention)
+        if is_mla != layer_uses_mla(layer_config, index):
+            raise RuntimeError(f"Draft layer {index} does not match saved MLA config")
+        logger.info(
+            "Draft layer %d: %s backend=%s dtype=%s%s",
+            index,
+            type(attention).__name__,
+            layer_config._attn_implementation,
+            next(attention.parameters()).dtype,
+            (
+                f" kv_rank={attention.kv_lora_rank} nope_dim={attention.nope_dim}"
+                f" rope_dim={attention.rope_dim} v_dim={attention.v_head_dim}"
+                if is_mla else ""
+            ),
+        )
+    logger.info(
+        "DSpark implementation: %s",
+        sys.modules[DSparkDraftModel.__module__].__file__,
+    )
+    return draft_model
+
+
 def run(args: argparse.Namespace) -> None:
     global torch, DynamicCache
+    block_verification = bool(getattr(args, "block_verification", False))
     if int(args.tree_top_k) < 1:
         raise ValueError("--tree-top-k must be >= 1")
     if int(args.tree_max_nodes) < 1:
         raise ValueError("--tree-max-nodes must be >= 1")
     if int(args.tree_top_k) > 1 and float(args.temperature) != 0.0:
         raise ValueError("Tree proposals require --temperature 0")
+    if int(args.tree_top_k) > 1 and block_verification:
+        raise ValueError(
+            "--block-verification supports linear DSpark only; use --tree-top-k 1"
+        )
     if (
         getattr(args, "ascend_devices", None)
         and getattr(args, "worker_shard_index", None) is None
@@ -2352,8 +2634,6 @@ def run(args: argparse.Namespace) -> None:
     import torch as torch_module  # noqa: PLC0415
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
     from transformers import DynamicCache as DynamicCacheClass  # noqa: PLC0415
-
-    from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
 
     torch = torch_module
     DynamicCache = DynamicCacheClass
@@ -2375,26 +2655,8 @@ def run(args: argparse.Namespace) -> None:
         .eval()
     )
 
-    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
-    sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
-    if sample_from_anchor is not None:
-        draft_config.sample_from_anchor = sample_from_anchor
-    draft_attn_impl = _resolve_draft_attn_impl(args.device, args.draft_attn_impl)
-    if draft_attn_impl is not None:
-        draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
-    d2t, t2d = _load_vocab_mapping_tensors(
-        draft_model_path=args.draft_model,
-        d2t_path=args.d2t_path,
-        t2d_path=args.t2d_path,
-    )
-    draft_model = DSparkDraftModel.from_pretrained(
-        args.draft_model,
-        config=draft_config,
-        d2t=d2t,
-        t2d=t2d,
-    )
-    draft_model = draft_model.to(device).eval()
-    _ensure_loaded_vocab_mappings(draft_model, args)
+    draft_model = load_dspark_draft(args, device)
+    draft_config = draft_model.config
     if getattr(draft_model, "correction_head", None) is not None:
         if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
@@ -2410,26 +2672,29 @@ def run(args: argparse.Namespace) -> None:
         sequential_head = f"markov:{draft_config.markov_head_type}"
     else:
         sequential_head = "none"
+    verification_mode = (
+        "block"
+        if block_verification
+        else "tree"
+        if int(args.tree_top_k) > 1
+        else "token"
+    )
     logger.info(
         "Loaded DSpark | block_size=%d sample_from_anchor=%s "
-        "max_proposal_tokens=%d sequential_head=%s tree_top_k=%d "
+        "max_proposal_tokens=%d sequential_head=%s verification=%s tree_top_k=%d "
         "tree_max_nodes=%d lm_head_fusion=%s "
         "dflash2_conv=%s dflash2_selector=%s",
         int(draft_model.block_size),
         bool(draft_config.sample_from_anchor),
         speculative_slots_for_draft(draft_model),
         sequential_head,
+        verification_mode,
         int(args.tree_top_k),
         int(args.tree_max_nodes),
         bool(getattr(draft_config, "correction_lm_head_fusion", False)),
         bool(getattr(draft_config, "dflash2_dynamic_conv", False)),
         bool(getattr(draft_config, "dflash2_candidate_selector", False)),
     )
-    logger.info(
-        "DSpark implementation: %s",
-        sys.modules[DSparkDraftModel.__module__].__file__,
-    )
-
     runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
     base_runner = (
         BaseModelOfflineRunner(target_model, tokenizer, args)
@@ -2483,6 +2748,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--block-verification",
+        action="store_true",
+        help=(
+            "Use lossless block verification for the linear DSpark path. When "
+            "unset, keep the default token-by-token verification."
+        ),
+    )
     parser.add_argument(
         "--tree-top-k",
         type=int,

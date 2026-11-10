@@ -40,7 +40,34 @@ Both `throughput` and `sweep` share the same options:
   --sweep-rate N             Number of sweep rate points (default: 10)
   --gen-kwargs JSON          Generation kwargs, e.g. '{"temperature":0.6}'
   --data-column-mapper JSON  Column mapping for guidellm (default: '{"text_column":"prompt"}')
+  --log-request-details      Add a serial pass with per-request DSpark metrics (default: off)
+  --request-details-max-tokens N
+                             Output limit for the detail pass in throughput mode (default: 4096)
 ```
+
+To record the prompt length, generated length, full generated text, and DSpark
+acceptance length for every request, enable the optional detail pass:
+
+```bash
+python evaluate.py throughput \
+    --target http://localhost:8000/v1 \
+    --subsets HumanEval \
+    --log-request-details \
+    --request-details-max-tokens 2048
+```
+
+The normal GuideLLM benchmark runs first and keeps its original concurrency and
+output. The detail pass then sends requests serially and writes one JSON object
+per request to `request_details/request_details_<subset>.jsonl`. Each row contains
+the full `prompt`, `prompt_tokens`, `completion_tokens`, `output`,
+`accepted_tokens_per_draft`, and `dspark_acceptance_length`. The last field follows
+the existing repository metric: `1 + num_accepted_tokens / num_drafts`.
+
+The detail pass calculates each row from the difference between vLLM's global
+`/metrics` counters before and after that request. Nothing else may send requests
+to the same vLLM server during this pass, or the per-request result will include
+that traffic. When `--log-request-details` is omitted, evaluation behavior and
+logging remain unchanged.
 
 ## SPEED-Bench
 

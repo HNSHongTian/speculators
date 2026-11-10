@@ -65,3 +65,42 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+
+    # TreeSpark training policy. These values are persisted so a checkpoint
+    # records the proposal policy it was trained against.
+    tree_training_enabled: bool = Field(
+        default=False,
+        description="Whether inference-aligned TreeSpark supervision was enabled.",
+    )
+    tree_loss_top_k: int = Field(
+        default=4,
+        description="Per-parent branching factor and frontier-width cap.",
+    )
+    tree_loss_num_anchors: int = Field(
+        default=128,
+        description="Maximum sampled anchors per sequence for tree replay.",
+    )
+    tree_loss_max_nodes: int = Field(
+        default=32,
+        description="Global non-root node budget used by training replay.",
+    )
+    tree_rank_margin: float = Field(
+        default=1.0,
+        description="Coverage hinge margin in draft-logit units.",
+    )
+    tree_rank_hinge_cap: float = Field(
+        default=4.0,
+        description="Coverage hinge cap; zero disables capping.",
+    )
+    tree_rank_top_j: int = Field(
+        default=4,
+        description="Number of target-important tokens used by coverage.",
+    )
+    tree_survival_alpha: float = Field(
+        default=0.1,
+        description="Weight of packed-edge survival NLL.",
+    )
+    tree_rank_alpha: float = Field(
+        default=0.1,
+        description="Weight of frontier coverage loss.",
+    )

@@ -13,6 +13,7 @@ from typing import Any
 import torch
 from torch.nn.functional import binary_cross_entropy_with_logits, softmax
 
+from speculators.models.dspark.bv_loss import block_ce_loss, block_tv_loss, bv_loss
 from speculators.models.metrics import (
     LossConfig,
     compound_loss,
@@ -45,7 +46,7 @@ def _masked_decayed_mean(
     return (weighted.sum(dim=1) / denominator).mean()
 
 
-def compute_metrics(
+def compute_metrics(  # noqa: C901
     logits: torch.Tensor,  # [1, T, draft_vocab_size] (Markov-corrected)
     targets: torch.Tensor,  # [1, T, draft_vocab_size]
     confidence_logits: torch.Tensor | None,  # [1, T] or None
@@ -57,6 +58,15 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
+    enable_bv_loss: bool = False,
+    bv_labels: torch.Tensor | None = None,
+    bv_valid_blocks: torch.Tensor | None = None,
+    bv_beta: torch.Tensor | None = None,
+    bv_annealing: bool = False,
+    bv_chunk_size: int = 16,
+    bv_loss_weight: float = 1.0,
+    ce_loss_weight: float = 0.0,
+    tv_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -76,9 +86,94 @@ def compute_metrics(
             dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
         )
 
-    loss, term_losses = compound_loss(
-        logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn
-    )
+    bv_metrics = {}
+    if enable_bv_loss:
+        if bv_labels is None or bv_valid_blocks is None:
+            raise ValueError("BV requires actual labels and complete-block validity")
+        if per_position_loss_weight == "dpace":
+            raise ValueError("BV loss cannot use D-PACE position weights")
+        if bv_beta is None:
+            bv_beta = logits.new_tensor(1.0, dtype=torch.float32)
+        block_logits = logits.reshape(-1, block_size, logits.shape[-1])[:, start_pos:]
+        block_targets = targets.reshape(-1, block_size, targets.shape[-1])[
+            :, start_pos:
+        ]
+        raw_bv_loss, bv_metrics = bv_loss(
+            block_logits,
+            block_targets,
+            bv_labels,
+            bv_valid_blocks,
+            bv_beta,
+            annealing=bv_annealing,
+            chunk_size=bv_chunk_size,
+        )
+        term_losses = {}
+        # Diagnostics/confidence use the same complete blocks as the BV main loss.
+        loss_mask = bv_valid_blocks[:, None].expand(-1, block_size).reshape(1, -1)
+        loss_mask = loss_mask & (pos_idx >= start_pos)
+        count = bv_metrics["bv_loss_total"]
+        weighted_bv_sum = bv_loss_weight * bv_metrics["bv_loss_sum"]
+        loss = bv_loss_weight * raw_bv_loss
+        bv_metrics.update(
+            bv_weighted_loss_sum=weighted_bv_sum,
+            bv_weighted_loss_total=count.clone(),
+            main_loss_sum=weighted_bv_sum.clone(),
+            main_loss_total=count.clone(),
+        )
+        token_positions = torch.arange(block_size, device=device)[start_pos:]
+        token_weights = dflash_loss_decay(
+            token_positions.float(),
+            gamma=gamma,
+            sample_from_anchor=sample_from_anchor,
+        )
+        if ce_loss_weight > 0:
+            ce, ce_sum = block_ce_loss(
+                block_logits,
+                block_targets,
+                bv_valid_blocks,
+                token_weights,
+                chunk_size=bv_chunk_size,
+            )
+            loss = loss + ce_loss_weight * ce
+            bv_metrics.update(
+                ce_loss_sum=ce_sum,
+                ce_loss_total=count.clone(),
+                ce_weighted_loss_sum=ce_loss_weight * ce_sum,
+                ce_weighted_loss_total=count.clone(),
+            )
+            bv_metrics["main_loss_sum"] += ce_loss_weight * ce_sum
+        if tv_loss_weight > 0:
+            tv, tv_sum = block_tv_loss(
+                block_logits,
+                block_targets,
+                bv_valid_blocks,
+                token_weights,
+                chunk_size=bv_chunk_size,
+            )
+            loss = loss + tv_loss_weight * tv
+            bv_metrics.update(
+                tv_loss_sum=tv_sum,
+                tv_loss_total=count.clone(),
+                tv_weighted_loss_sum=tv_loss_weight * tv_sum,
+                tv_weighted_loss_total=count.clone(),
+            )
+            bv_metrics["main_loss_sum"] += tv_loss_weight * tv_sum
+        for name, weight in (
+            ("bv", bv_loss_weight),
+            ("ce", ce_loss_weight),
+            ("tv", tv_loss_weight),
+        ):
+            bv_metrics[f"{name}_loss_weight_sum"] = count * weight
+            bv_metrics[f"{name}_loss_weight_total"] = count.clone()
+    else:
+        loss, term_losses = compound_loss(
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_config=loss_config,
+            decay_fn=decay_fn,
+        )
 
     # Analytical per-position acceptance rate = distributional overlap.
     with torch.no_grad():
@@ -129,6 +224,18 @@ def compute_metrics(
     ones = torch.ones((), device=device)
     metrics["loss_sum"] = loss.detach().clone()
     metrics["loss_total"] = ones
+    if enable_bv_loss:
+        metrics.update(bv_metrics)
+        count = bv_metrics["bv_loss_total"]
+        # Log the actual objective, not the annealing backward surrogate.
+        metrics["loss_sum"] = bv_metrics.get(
+            "main_loss_sum", bv_metrics["bv_loss_sum"]
+        ).clone()
+        if confidence_logits is not None:
+            metrics["loss_sum"] += confidence_head_alpha * conf_loss.detach() * count
+            metrics["confidence_loss_weight_sum"] = count * confidence_head_alpha
+            metrics["confidence_loss_weight_total"] = count.clone()
+        metrics["loss_total"] = count.clone()
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
         metrics[f"{term_name}_total"] = ones.clone()
@@ -150,6 +257,13 @@ def compute_metrics(
     # Per-position greedy accuracy
     pred_ids = torch.argmax(logits, dim=-1)
     target_ids = torch.argmax(targets, dim=-1)
+    if enable_bv_loss:
+        predicted = pred_ids.reshape(-1, block_size)[:, start_pos:]
+        correct_labels = (predicted == bv_labels) & bv_valid_blocks[:, None]
+        metrics["bv_sampled_label_acc_sum"] = correct_labels.sum().float()
+        metrics["bv_sampled_label_acc_total"] = (
+            bv_valid_blocks.sum().float() * predicted.shape[1]
+        )
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )

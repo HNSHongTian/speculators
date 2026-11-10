@@ -2,6 +2,8 @@ import json
 import logging
 import time
 import warnings
+from contextlib import nullcontext
+from itertools import islice
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -21,6 +23,13 @@ from transformers import (
 )
 
 from speculators.model import SpeculatorModel
+from speculators.models.dspark.loss_config import loss_weights_for_epoch
+from speculators.train.bv import (
+    BV_RECIPE,
+    bv_progress,
+    scale_bv_for_backward,
+    validate_bv_resume,
+)
 from speculators.train.checkpointer import (
     BaseCheckpointer,
     DistributedCheckpointer,
@@ -138,6 +147,9 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
+    bv_anneal_epochs: float = 3.0
+    loss_weight_schedule: list[dict[str, float]] | None = None
+    bv_recipe: dict | None = None
 
 
 def _resolve_scheduler_steps(
@@ -210,6 +222,76 @@ class Trainer:
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
 
+    @property
+    def bv_enabled(self) -> bool:
+        return bool((self.config.train_call_kwargs or {}).get("enable_bv_loss", False))
+
+    def _bv_recipe(self) -> dict:
+        dataset = getattr(self.train_loader.dataset, "data", None)
+        kwargs = self.config.train_call_kwargs or {}
+        bv_weight = kwargs.get("bv_loss_weight", 1.0)
+        ce_weight = kwargs.get("ce_loss_weight", 0.0)
+        tv_weight = kwargs.get("tv_loss_weight", 0.0)
+        mixture = {}
+        # Preserve old pure-BV checkpoint recipes byte-for-byte in their fields.
+        if bv_weight != 1.0 or ce_weight != 0.0 or tv_weight != 0.0:
+            mixture = {
+                "bv_loss_weight": bv_weight,
+                "ce_loss_weight": ce_weight,
+                "tv_loss_weight": tv_weight,
+            }
+            if tv_weight > 0:
+                mixture["tv_decay_gamma"] = kwargs.get("gamma", 4.0)
+            if ce_weight > 0:
+                mixture["ce_decay_gamma"] = kwargs.get("gamma", 4.0)
+        if self.config.loss_weight_schedule is not None:
+            mixture["loss_weight_schedule"] = self.config.loss_weight_schedule
+            if any(
+                point["ce"] > 0 or point["tv"] > 0
+                for point in self.config.loss_weight_schedule
+            ):
+                mixture["token_loss_decay_gamma"] = kwargs.get("gamma", 4.0)
+        return {
+            **(self.config.bv_recipe or {}),
+            **mixture,
+            "objective": BV_RECIPE,
+            "anneal_epochs": self.config.bv_anneal_epochs,
+            "world_size": dist.get_world_size() if self.is_distributed else 1,
+            "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
+            "epochs": self.config.num_epochs,
+            "lr": self.config.lr,
+            "optimizer": self.config.optimizer,
+            "weight_decay": self.config.weight_decay,
+            "scheduler_type": self.config.scheduler_type,
+            "scheduler_warmup_ratio": self.config.scheduler_warmup_ratio,
+            "scheduler_warmup_steps": self.config.scheduler_warmup_steps,
+            "scheduler_total_steps": self.config.scheduler_total_steps,
+            "scheduler_num_cosine_cycles": self.config.scheduler_num_cosine_cycles,
+        }
+
+    def _loss_weight_kwargs(self, epoch: int, kwargs: dict) -> dict:
+        """Return a copied call config with fixed or epoch-scheduled weights."""
+        weights = loss_weights_for_epoch(
+            self.config.loss_weight_schedule,
+            epoch,
+            fixed_bv=kwargs.get("bv_loss_weight", 1.0),
+            fixed_ce=kwargs.get("ce_loss_weight", 0.0),
+            fixed_tv=kwargs.get("tv_loss_weight", 0.0),
+            fixed_confidence=kwargs.get("confidence_head_alpha", 1.0),
+        )
+        resolved = dict(kwargs)
+        resolved.update(
+            bv_loss_weight=weights["bv"],
+            ce_loss_weight=weights["ce"],
+            tv_loss_weight=weights["tv"],
+            confidence_head_alpha=weights["confidence"],
+        )
+        return resolved
+
+    def _bv_rng_context(self):
+        devices = [] if self.device_type == "cpu" else [self.local_rank]
+        return torch.random.fork_rng(devices=devices, device_type=self.device_type)
+
     def _save_training_state(self, epoch: int, local_step: int) -> None:
         if not self.is_distributed or dist.get_rank() == 0:
             state = {
@@ -217,6 +299,12 @@ class Trainer:
                 "local_step": local_step,
                 "global_step": self.global_step,
             }
+            if self.bv_enabled:
+                state["bv"] = {
+                    "recipe": self._bv_recipe(),
+                    "steps_in_full_epoch": self._bv_steps_in_epoch,
+                    "optimizer_updates": self._bv_optimizer_updates,
+                }
             p = self._training_state_path(epoch)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(state))
@@ -283,6 +371,16 @@ class Trainer:
             self._resume_global_step = 0
         self.global_step = self._resume_global_step
         self.best_val_loss = float("inf")
+        if self.bv_enabled:
+            self._bv_optimizer_updates = 0
+            self._bv_steps_in_epoch = len(self.train_loader)
+            self._bv_resume_steps = None
+            if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
+                bv_state = self._load_training_state().get("bv", {})
+                validate_bv_resume(bv_state, self._bv_recipe())
+                self._bv_optimizer_updates = bv_state["optimizer_updates"]
+                if self._resume_local_step:
+                    self._bv_resume_steps = bv_state["steps_in_full_epoch"]
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
             saved = self.checkpointer.load_best_val_loss()
@@ -389,6 +487,16 @@ class Trainer:
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
             self.checkpointer.load_scheduler_state_dict(self.schedulers)
+            if self.bv_enabled:
+                # Scheduler construction performs an initial step. Loading only
+                # its state does not restore optimizer param-group learning rates.
+                for scheduler in self.schedulers:
+                    for group, lr in zip(
+                        scheduler.optimizer.param_groups,
+                        scheduler.get_last_lr(),
+                        strict=True,
+                    ):
+                        group["lr"] = lr
 
     def _optimizers_zero_grad(self):
         for opt in self.optimizers:
@@ -436,18 +544,41 @@ class Trainer:
             )
         return skip_steps
 
-    def train_epoch(self, epoch: int):
+    def train_epoch(self, epoch: int):  # noqa: C901
         self.model.train()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
             self.train_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
 
         # Capture full-epoch step count before any resume fast-skip mutation.
         num_steps = len(self.train_loader)
+        if self.bv_enabled:
+            if self._bv_resume_steps is not None and self._bv_resume_steps != num_steps:
+                raise ValueError("BV resume full-epoch length changed")
+            self._bv_resume_steps = None
+            self._bv_steps_in_epoch = num_steps
+            epoch_weights = self._loss_weight_kwargs(
+                epoch, self.config.train_call_kwargs or {}
+            )
+            root_logger.info(
+                "Epoch %d loss weights: bv=%s ce=%s tv=%s confidence=%s",
+                epoch + 1,
+                epoch_weights["bv_loss_weight"],
+                epoch_weights["ce_loss_weight"],
+                epoch_weights["tv_loss_weight"],
+                epoch_weights["confidence_head_alpha"],
+            )
 
         # Determine how many batches to skip for mid-epoch resume.
         skip_steps = self._prepare_resume_skip(epoch)
 
         train_loader = self.train_loader
+        if self.bv_enabled and skip_steps:
+            sampler = self.train_loader.batch_sampler
+            if not (
+                hasattr(sampler, "_generate_batches")
+                and hasattr(sampler, "_cached_generated_batches")
+            ):
+                train_loader = islice(train_loader, skip_steps, None)
         if self.rank == 0:
             train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
@@ -471,13 +602,40 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            with torch.autocast(
-                self.device_type, dtype=self.config.hidden_states_dtype
-            ):
-                timer.mark("fetch")
-                _draft_tokens, loss, metrics = self.model(
-                    **gpu_batch, **(self.config.train_call_kwargs or {})
+            call_kwargs = self.config.train_call_kwargs or {}
+            if self.bv_enabled:
+                call_kwargs = self._loss_weight_kwargs(epoch, call_kwargs)
+                beta, annealing = bv_progress(
+                    epoch, local_step, num_steps, self.config.bv_anneal_epochs
                 )
+                call_kwargs.update(
+                    bv_beta=gpu_batch["hidden_states"].new_tensor(
+                        beta, dtype=torch.float32
+                    ),
+                    bv_annealing=annealing,
+                )
+
+            with self._bv_rng_context() if self.bv_enabled else nullcontext():
+                if self.bv_enabled:
+                    # Stable anchors/dropout at the same resumed data position.
+                    seed = (self.config.bv_recipe or {}).get("seed", 42)
+                    torch.manual_seed(
+                        seed + epoch * 1000000007 + local_step * 1009 + self.rank
+                    )
+                with torch.autocast(
+                    self.device_type, dtype=self.config.hidden_states_dtype
+                ):
+                    timer.mark("fetch")
+                    _draft_tokens, loss, metrics = self.model(
+                        **gpu_batch, **call_kwargs
+                    )
+
+            should_update = True
+            if self.bv_enabled:
+                loss, should_update = scale_bv_for_backward(
+                    loss, metrics["bv_loss_total"]
+                )
+                metrics["bv_empty_batches"] = loss.new_tensor(float(not should_update))
 
             timer.mark("fwd")
             self._optimizers_zero_grad()
@@ -485,12 +643,20 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             timer.mark("bwd")
-            self._optimizers_step()
+            if should_update:
+                self._optimizers_step()
+                if self.bv_enabled:
+                    self._bv_optimizer_updates += 1
+            elif self.bv_enabled:
+                root_logger.warning(
+                    "BV batch has no valid blocks globally; update skipped"
+                )
 
             current_lrs = {
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
             }
-            self._schedulers_step()
+            if should_update:
+                self._schedulers_step()
             timer.mark("opt")
             t_before_fetch = timer.now() or time.perf_counter()
 
@@ -533,11 +699,18 @@ class Trainer:
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
+        if not self.bv_enabled:
+            return self._val_epoch(epoch)
+        with self._bv_rng_context():
+            torch.manual_seed(42)
+            return self._val_epoch(epoch)
+
+    def _val_epoch(self, epoch: int) -> dict[str, float] | None:
         if self.val_loader is None:
             return None
         self.model.eval()
         if hasattr(self.val_loader.batch_sampler, "set_epoch"):
-            self.val_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
+            self.val_loader.batch_sampler.set_epoch(0 if self.bv_enabled else epoch)  # type: ignore[union-attr]
         val_loader = self.val_loader
         if self.rank == 0:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
@@ -555,9 +728,16 @@ class Trainer:
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
-                _draft_tokens, _loss, metrics = self.model(
-                    **gpu_batch, **(self.config.val_call_kwargs or {})
-                )
+                call_kwargs = self.config.val_call_kwargs or {}
+                if self.bv_enabled:
+                    call_kwargs = self._loss_weight_kwargs(epoch, call_kwargs)
+                    call_kwargs.update(
+                        bv_annealing=False,
+                        bv_beta=gpu_batch["hidden_states"].new_tensor(
+                            1.0, dtype=torch.float32
+                        ),
+                    )
+                _draft_tokens, _loss, metrics = self.model(**gpu_batch, **call_kwargs)
 
             if self.is_distributed:
                 for m in metrics.values():
@@ -567,6 +747,8 @@ class Trainer:
                 val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
 
         world_size = dist.get_world_size() if self.is_distributed else 1
+        if self.bv_enabled and val_metrics.get("bv_loss_total", 0) == 0:
+            raise ValueError("BV validation has no complete valid blocks")
         val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
         val_metrics = normalize_counted_metrics(val_metrics, world_size)
         val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
@@ -619,6 +801,8 @@ class Trainer:
             self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
             if self.schedulers:
                 self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+            if self.bv_enabled:
+                self._save_training_state(epoch, local_step=0)
         elif self.config.checkpoint_freq >= 1 and not (
             epoch == 0 or (epoch + 1) % int(self.config.checkpoint_freq) == 0
         ):

@@ -240,6 +240,71 @@ def test_dry_run_flag_parses(monkeypatch):
     assert _parse(monkeypatch, ["--dry-run"]).dry_run is True
 
 
+def test_tree_training_flags_parse(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "dspark",
+            "--max-anchors",
+            "16",
+            "--enable-tree-training",
+            "--tree-loss-top-k",
+            "3",
+            "--tree-loss-num-anchors",
+            "8",
+            "--tree-loss-max-nodes",
+            "12",
+            "--tree-rank-top-j",
+            "3",
+            "--tree-survival-alpha",
+            "0.2",
+            "--tree-rank-alpha",
+            "0.05",
+        ],
+    )
+    assert args.enable_tree_training is True
+    assert args.tree_loss_top_k == 3
+    assert args.tree_loss_num_anchors == 8
+    assert args.tree_loss_max_nodes == 12
+    assert args.tree_rank_top_j == 3
+    assert args.tree_survival_alpha == pytest.approx(0.2)
+    assert args.tree_rank_alpha == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--speculator-type", "eagle3", "--enable-tree-training"],
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-tree-training",
+            "--enable-bv-loss",
+        ],
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-tree-training",
+            "--tree-loss-top-k",
+            "1",
+        ],
+        [
+            "--speculator-type",
+            "dspark",
+            "--enable-tree-training",
+            "--max-anchors",
+            "4",
+            "--tree-loss-num-anchors",
+            "5",
+        ],
+    ],
+)
+def test_invalid_tree_training_flags_error(monkeypatch, extra):
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, extra)
+
+
 def test_draft_config_with_from_pretrained_errors(monkeypatch):
     with pytest.raises(SystemExit):
         _parse(monkeypatch, ["--draft-config", "c", "--from-pretrained", "p"])
@@ -430,7 +495,9 @@ def test_mtp_with_from_pretrained_parses(monkeypatch):
 def _patch_verifier(monkeypatch, hidden_size: int, vocab_size: int):
     monkeypatch.setattr(
         "scripts.train.get_verifier_config",
-        lambda _path: SimpleNamespace(hidden_size=hidden_size, vocab_size=vocab_size),
+        lambda _path, **_kwargs: SimpleNamespace(
+            hidden_size=hidden_size, vocab_size=vocab_size
+        ),
     )
 
 

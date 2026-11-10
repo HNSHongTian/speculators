@@ -14,6 +14,10 @@ Extends Eagle-3 with parallel multi-token prediction across multiple depths, usi
 
 Predicts all draft tokens in a single forward pass using block-based prediction with Qwen3-style draft layers. Newer, with support improving rapidly.
 
+## [TreeSpark Training](treespark_training.md)
+
+Adds inference-aligned tree replay, packed-edge survival and frontier coverage objectives to DSpark training.
+
 ## [MTP](mtp.md)
 
 Finetunes the model's native multi-token prediction head on domain-specific data. Available for models with built-in MTP support (e.g. Qwen3-Next, Qwen3.5).
@@ -21,6 +25,8 @@ Finetunes the model's native multi-token prediction head on domain-specific data
 ## Choosing an Algorithm
 
 All algorithms can be paired with any supported verifier model. For help choosing between them, see the [Decision Guide](decision_guide.md).
+
+For optional MLA attention in Qwen3 draft models, see [Qwen3 Draft MLA](qwen3_mla.md).
 
 ## Adding New Algorithms
 

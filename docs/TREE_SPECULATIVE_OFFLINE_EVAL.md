@@ -3,14 +3,24 @@
 ## 目标和范围
 
 本适配参考 `TreeSpark-main` 的顺序离线推理实现，把树形候选构造和单次
-target 树验证接入 `scripts/evaluate/dspark_offline_eval.py`。它只修改离线推理，
-不包含 TreeSpark 的树一致性训练目标。
+target 树验证接入 `scripts/evaluate/dspark_offline_eval.py`。本文聚焦离线推理；
+树一致性训练的实现和参数见
+[TreeSpark 训练适配开发说明](user_guide/algorithms/treespark_training.md)。
 
 来源与许可说明见 [`TREESPARK_NOTICE.md`](TREESPARK_NOTICE.md)。
 
 默认行为保持不变：`--tree-top-k 1` 使用原有 DSpark 线性投机；设置
 `--tree-top-k >= 2` 才启用树投机。普通 DSpark checkpoint 可以直接用于树推理，
 但没有经过 TreeSpark 树目标训练时，候选排序和接受长度可能低于树训练模型。
+
+## MLA draft
+
+树投机同样支持 `layer_types` 包含 `"mla"` 的 DSpark checkpoint，以及普通层和
+MLA 的混合配置。普通离线入口与 Ascend EP 入口自动恢复训练时的结构，无需额外
+MLA 开关。`--draft-attn-impl sdpa` 选择计算后端，不会覆盖 checkpoint 的层类型。
+
+启动示例、实际 attention 类型日志及执行范围见
+[Qwen3 MLA 离线评测](user_guide/algorithms/qwen3_mla.md#dspark-离线推理测评含树投机)。
 
 ## TreeSpark 到 Speculators 的映射
 
@@ -89,6 +99,23 @@ Xingchen4 expert-parallel 离线评测只需在现有命令中增加：
 ```bash
 --tree-top-k 1
 ```
+
+线性 DSpark 默认仍使用逐 token rejection sampling。只有显式加上
+`--block-verification` 才切换为无损 block verification：
+
+```bash
+--tree-top-k 1 \
+--temperature 1 \
+--block-verification
+```
+
+block verification 会选择通过抽样的最长前缀，并在未全接受时
+使用缩放残差分布抽取 correction token。它只适用于线性 proposal，
+与 `--tree-top-k >= 2` 互斥。不传该参数时，原 token verification
+路径不变。
+
+`xingchen4_eval_ep/evaluate_ep.py` 也支持同一个参数开关。EP 入口当前
+要求 `--temperature 0`，因此其各 rank 会保持完全一致的解码控制流。
 
 ## 限制
 

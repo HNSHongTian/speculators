@@ -33,6 +33,7 @@ from speculators.train.distributed import (
     is_distributed,
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
+from speculators.train.metric_reduce import reduce_metrics
 from speculators.train.optimizers import build_optimizers
 from speculators.train.utils import normalize_counted_metrics
 
@@ -499,8 +500,7 @@ class Trainer:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
                 if self.is_distributed:
-                    for v in metrics.values():
-                        dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
+                    metrics = reduce_metrics(metrics, device=loss.device)
 
                 metrics = {k: v.item() for k, v in metrics.items()}
                 world_size = dist.get_world_size() if self.is_distributed else 1
@@ -560,8 +560,7 @@ class Trainer:
                 )
 
             if self.is_distributed:
-                for m in metrics.values():
-                    dist.all_reduce(m, op=dist.ReduceOp.SUM)
+                metrics = reduce_metrics(metrics, device=_loss.device)
 
             for k, v in metrics.items():
                 val_metrics[k] = val_metrics.get(k, 0.0) + v.item()

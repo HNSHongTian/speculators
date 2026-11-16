@@ -107,6 +107,9 @@ def _install_trpo_forward(draft: torch.nn.Module, trpo_cfg: dict[str, Any]) -> N
         counted = {}
         device = loss.device
         for key, value in metrics.items():
+            if key.endswith(("_sum", "_total")):
+                counted[key] = torch.tensor(float(value), device=device)
+                continue
             counted[f"{key}_sum"] = torch.tensor(float(value), device=device)
             counted[f"{key}_total"] = torch.ones((), device=device)
         counted["loss_sum"] = torch.tensor(

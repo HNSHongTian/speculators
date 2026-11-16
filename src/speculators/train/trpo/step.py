@@ -9,6 +9,11 @@ import torch
 from speculators.train.trpo.advantage import compute_depth_advantages
 from speculators.train.trpo.expand import expand_and_pack_tree, replay_node_logprobs
 from speculators.train.trpo.loss import trpo_loss_from_groups
+from speculators.train.trpo.metrics import (
+    add_tree_metrics,
+    empty_tree_metrics,
+    valid_response_suffix,
+)
 from speculators.train.trpo.reward import compute_node_rewards, merge_gold_path
 from speculators.tree.pack import PackMode
 
@@ -90,9 +95,15 @@ def compute_trpo_batch_loss(
     valid = mask_blocks.any(dim=-1)
 
     valid_idx = torch.nonzero(valid, as_tuple=False).view(-1)
+    # Fixed keys even for empty ranks, so distributed metric reductions align.
+    diagnostics = empty_tree_metrics(_proposal_tokens(draft))
+    empty_metrics = dict.fromkeys(
+        ("trpo_loss", "trpo_anchors", "trpo_nodes", "trpo_gold_nodes",
+         "trpo_mean_reward_gold", "trpo_pg", "trpo_ce"), 0.0,
+    )
     if valid_idx.numel() == 0:
         zero = base_logits.sum() * 0.0
-        return zero, {"trpo_loss": 0.0, "trpo_anchors": 0.0}
+        return zero, {**empty_metrics, **diagnostics}
 
     k = min(int(max_trpo_anchors), int(valid_idx.numel()))
     # Deterministic subset: first k valid (already sorted by select_anchors).
@@ -104,6 +115,7 @@ def compute_trpo_batch_loss(
 
     losses: list[torch.Tensor] = []
     metrics_acc: dict[str, float] = {
+        **empty_metrics,
         "trpo_anchors": float(k),
         "trpo_nodes": 0.0,
         "trpo_gold_nodes": 0.0,
@@ -134,6 +146,11 @@ def compute_trpo_batch_loss(
             max_nodes=tree_max_nodes,
             pack_mode=tree_pack_mode,
         )
+        # Inspect only the model's packed tree, before injecting any gold nodes.
+        suffix = valid_response_suffix(
+            input_ids, loss_mask, document_ids, anchor=anchor, depth=prop_len,
+        )
+        add_tree_metrics(diagnostics, packed, suffix)
         tree = merge_gold_path(packed, gold_token_ids=gold, top_k=tree_top_k)
         rewards = compute_node_rewards(tree, gold_token_ids=gold)
         advantages = compute_depth_advantages(tree, rewards)
@@ -208,7 +225,7 @@ def compute_trpo_batch_loss(
 
     if not losses:
         zero = base_logits.sum() * 0.0
-        return zero, {**metrics_acc, "trpo_loss": 0.0}
+        return zero, {**metrics_acc, "trpo_loss": 0.0, **diagnostics}
 
     loss = torch.stack(losses).mean()
     n = float(len(losses))
@@ -222,4 +239,4 @@ def compute_trpo_batch_loss(
     # Keep a tiny graph attachment so unused backbone params stay connected
     # when all advantages are zero (still fine to step).
     loss = loss + 0.0 * base_logits.float().sum() * 0.0
-    return loss, metrics_acc
+    return loss, {**metrics_acc, **diagnostics}

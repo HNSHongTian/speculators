@@ -77,7 +77,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/v1/models
 ```
 
 ```bash
-# 终端 2：TRPO（NPU 3-6，MAX_STEPS=0 跑完 1 个 epoch）
+# 终端 2：TRPO（NPU 3-6，每步 256 个 anchor，hidden states 落盘复用）
 cd /home/z50062551/speculators
 TRAIN_NPUS=3,4,5,6 NUM_TRAIN_NPUS=4 MAX_STEPS=0 \
   bash examples/train/trpo_qwen3_4b_trial.sh

@@ -24,8 +24,9 @@ LR=6e-4
 LOGGER="tensorboard"
 
 BLOCK_SIZE=7
-MAX_ANCHORS=32
-MAX_TRPO_ANCHORS=4
+# Backbone samples this many anchors; TRPO builds a tree on each of them.
+MAX_ANCHORS=256
+MAX_TRPO_ANCHORS=256
 TREE_TOP_K=4
 TREE_MAX_NODES=16
 TREE_PACK_MODE=leaf-up
@@ -77,7 +78,8 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
   --no-enable-confidence-head \
   --loss-fn '{"ce": 0.1, "tv": 0.9}' \
   --on-missing generate \
-  --on-generate delete \
+  --on-generate cache \
+  --request-timeout 120 \
   --num-workers 2 \
   > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"

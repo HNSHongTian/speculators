@@ -326,13 +326,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        compute_verifier_targets: bool = True,
         **kwargs,
     ):
         """Run the anchored-block draft transformer up to the draft logits.
 
         Returns ``(hidden, logits, targets, aligned_loss_mask,
         anchored_block_indices)``. DSpark reuses this and adds its Markov and
-        confidence heads before computing its own loss.
+        confidence heads before computing its own loss. ``targets`` is None
+        when compute_verifier_targets=False (used by token-supervised TRPO).
         """
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
@@ -377,16 +379,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             anchor_positions, self.block_size
         )  # shape: [num_anchors*block_size]
 
-        with torch.no_grad():
-            verifier_logits = self.verifier_lm_head(
-                self.verifier_norm(verifier_last_hidden_states)
-            )
-            if not self.config.sample_from_anchor:
-                # False: shift right by 1 so slot j predicts token at position j
-                verifier_logits = torch.roll(verifier_logits, 1, dims=1)
-            # else: True, slot k predicts token at position k+1 (next), no shift
-            targets = verifier_logits[:, anchored_block_indices]
-            # shape: [1, num_anchors*block_size, draft_vocab_size]
+        # TRPO uses token IDs as supervision and does not consume these logits.
+        targets = None
+        if compute_verifier_targets:
+            with torch.no_grad():
+                verifier_logits = self.verifier_lm_head(
+                    self.verifier_norm(verifier_last_hidden_states)
+                )
+                if not self.config.sample_from_anchor:
+                    # False: shift right by 1 so slot j predicts token at position j
+                    verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+                # else: True, slot k predicts token at position k+1 (next), no shift
+                targets = verifier_logits[:, anchored_block_indices]
+                # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
             noise_embedding = layer(

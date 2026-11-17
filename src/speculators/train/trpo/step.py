@@ -81,6 +81,7 @@ def compute_trpo_batch_loss(
             document_ids,
             position_ids,
             max_anchors=max_anchors,
+            compute_verifier_targets=False,
         )
     )
 
@@ -114,6 +115,7 @@ def compute_trpo_batch_loss(
     sfa = _sample_from_anchor(draft)
 
     losses: list[torch.Tensor] = []
+    loss_statistics: list[torch.Tensor] = []
     metrics_acc: dict[str, float] = {
         **empty_metrics,
         "trpo_anchors": float(k),
@@ -190,38 +192,21 @@ def compute_trpo_batch_loss(
             block_hidden=hidden_blocks[bi],
             first_draft_slot=first_slot,
         )
-        gold_idx = [i for i in active if tree.is_gold[i]]
-        gold_logps = (
-            replay_node_logprobs(
-                draft,
-                tree_tokens=tree.tokens,
-                tree_parents=tree.parents,
-                tree_depths=tree.depths,
-                active_indices=gold_idx,
-                anchor_token_id=int(input_ids[0, anchor].item()),
-                block_base_logits=base_blocks[bi],
-                block_hidden=hidden_blocks[bi],
-                first_draft_slot=first_slot,
-            )
-            if gold_idx
-            else None
-        )
-        # Avoid double replay cost: slice from active when possible.
-        if gold_idx and gold_logps is not None:
-            # already computed separately for clarity / correct graph
-            pass
+        # Reuse the same graph: PG and CE gradients accumulate automatically.
+        gold_positions = [j for j, i in enumerate(active) if tree.is_gold[i]]
+        gold_logps = logps[gold_positions] if gold_positions else None
 
         loss_i, m_i = trpo_loss_from_groups(
             advantages=adv_t,
             log_probs=logps,
             gold_log_probs=gold_logps,
             lambda_ce=lambda_ce,
+            tensor_metrics=True,
         )
         losses.append(loss_i)
         metrics_acc["trpo_nodes"] += float(len(active))
-        metrics_acc["trpo_gold_nodes"] += float(len(gold_idx))
-        for key in ("trpo_pg", "trpo_ce"):
-            metrics_acc[key] = metrics_acc.get(key, 0.0) + m_i.get(key, 0.0)
+        metrics_acc["trpo_gold_nodes"] += float(len(gold_positions))
+        loss_statistics.append(torch.stack([m_i["trpo_pg"], m_i["trpo_ce"]]))
 
     if not losses:
         zero = base_logits.sum() * 0.0
@@ -229,9 +214,14 @@ def compute_trpo_batch_loss(
 
     loss = torch.stack(losses).mean()
     n = float(len(losses))
-    metrics_acc["trpo_loss"] = float(loss.detach().item())
-    metrics_acc["trpo_pg"] = metrics_acc.get("trpo_pg", 0.0) / n
-    metrics_acc["trpo_ce"] = metrics_acc.get("trpo_ce", 0.0) / n
+    # One host transfer for batch loss statistics, instead of per-anchor reads.
+    pg_ce = torch.stack(loss_statistics).mean(dim=0)
+    loss_value, pg_value, ce_value = torch.cat(
+        [loss.detach().reshape(1), pg_ce]
+    ).cpu().tolist()
+    metrics_acc["trpo_loss"] = loss_value
+    metrics_acc["trpo_pg"] = pg_value
+    metrics_acc["trpo_ce"] = ce_value
     metrics_acc["trpo_nodes"] = metrics_acc["trpo_nodes"] / n
     metrics_acc["trpo_gold_nodes"] = metrics_acc["trpo_gold_nodes"] / n
     if gold_reward_count:

@@ -263,6 +263,20 @@ class DSparkDraftModel(DFlashDraftModel):
         tree_rank_alpha: float = 0.1,
         **kwargs,
     ):
+        if "specopd_config" in kwargs:
+            from speculators.train.specopd.runtime import specopd_forward  # noqa: PLC0415
+
+            if enable_bv_loss or enable_tree_training:
+                raise ValueError("SpecOPD cannot be combined with BV or TreeSpark")
+            return specopd_forward(
+                self,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                loss_mask=loss_mask,
+                document_ids=document_ids,
+                position_ids=position_ids,
+                **kwargs,
+            )
         if enable_bv_loss and enable_tree_training:
             raise ValueError(
                 "BV and TreeSpark training use incompatible distributed loss scaling"
@@ -374,9 +388,9 @@ class DSparkDraftModel(DFlashDraftModel):
                 max_nodes=tree_loss_max_nodes,
                 use_draft_vocab=self.use_draft_vocab,
                 d2t=self.d2t,
-                reference_top1_ids=corrected_logits[
-                    :, first_draft_slot
-                ].detach().argmax(dim=-1),
+                reference_top1_ids=corrected_logits[:, first_draft_slot]
+                .detach()
+                .argmax(dim=-1),
             )
             if tree_inputs is not None:
                 tree_loss, tree_metrics = compute_tree_training_loss(
@@ -389,8 +403,8 @@ class DSparkDraftModel(DFlashDraftModel):
                 tree_metrics["tree_anchor_eligible_ratio_sum"] = (
                     eligible.to(torch.float32).sum().detach()
                 )
-                tree_metrics["tree_anchor_eligible_ratio_total"] = (
-                    eligible.new_tensor(eligible.numel(), dtype=torch.float32)
+                tree_metrics["tree_anchor_eligible_ratio_total"] = eligible.new_tensor(
+                    eligible.numel(), dtype=torch.float32
                 )
 
         if self.confidence_head is not None:

@@ -226,6 +226,52 @@ class Trainer:
     def bv_enabled(self) -> bool:
         return bool((self.config.train_call_kwargs or {}).get("enable_bv_loss", False))
 
+    @property
+    def specopd_enabled(self) -> bool:
+        return "specopd_config" in (self.config.train_call_kwargs or {})
+
+    def _specopd_recipe(self):
+        cfg = (self.config.train_call_kwargs or {})["specopd_config"]
+        recipe = {
+            k: v
+            for k, v in cfg.items()
+            if k
+            not in {
+                "endpoints",
+                "concurrency",
+                "request_timeout",
+                "max_retries",
+                "server_model",
+            }
+        }
+        recipe.update(
+            {
+                k: getattr(self.config, k)
+                for k in (
+                    "num_epochs",
+                    "lr",
+                    "optimizer",
+                    "weight_decay",
+                    "scheduler_type",
+                    "scheduler_warmup_steps",
+                    "scheduler_warmup_ratio",
+                    "scheduler_total_steps",
+                    "scheduler_num_cosine_cycles",
+                    "muon_lr",
+                    "muon_momentum",
+                    "muon_weight_decay",
+                    "muon_ns_steps",
+                    "muon_adjust_lr_fn",
+                )
+            }
+        )
+        recipe["world_size"] = dist.get_world_size() if self.is_distributed else 1
+        recipe["dataset_fingerprint"] = getattr(
+            getattr(self.train_loader.dataset, "data", None), "_fingerprint", None
+        )
+        recipe["hidden_states_dtype"] = str(self.config.hidden_states_dtype)
+        return recipe
+
     def _bv_recipe(self) -> dict:
         dataset = getattr(self.train_loader.dataset, "data", None)
         kwargs = self.config.train_call_kwargs or {}
@@ -299,6 +345,11 @@ class Trainer:
                 "local_step": local_step,
                 "global_step": self.global_step,
             }
+            if self.specopd_enabled:
+                state["specopd"] = {
+                    "recipe": self._specopd_recipe(),
+                    "steps_in_full_epoch": self._specopd_steps_in_epoch,
+                }
             if self.bv_enabled:
                 state["bv"] = {
                     "recipe": self._bv_recipe(),
@@ -321,7 +372,33 @@ class Trainer:
                 root_logger.warning(f"Failed to read training state {p}: {e}")
         return {}
 
-    def setup_trainer(self):
+    def setup_trainer(self):  # noqa: C901
+        if self.specopd_enabled:
+            self._specopd_steps_in_epoch = len(self.train_loader)
+            if self.config.fsdp_shard:
+                raise ValueError("SpecOPD does not yet support FSDP")
+        if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
+            saved_specopd = self._load_training_state().get("specopd")
+            if self.specopd_enabled:
+                if (
+                    not saved_specopd
+                    or saved_specopd.get("recipe") != self._specopd_recipe()
+                ):
+                    raise ValueError(
+                        "SpecOPD resume recipe mismatch. To start a new phase, use "
+                        "--from-pretrained CHECKPOINT and a new --save-path."
+                    )
+                if saved_specopd["steps_in_full_epoch"] != len(self.train_loader):
+                    raise ValueError("SpecOPD resume full-epoch length changed")
+                if (
+                    self.config.scheduler_type != "none"
+                    and not self.checkpointer.scheduler_path(
+                        self.checkpointer.previous_epoch
+                    ).exists()
+                ):
+                    raise ValueError("SpecOPD resume requires scheduler state")
+            elif saved_specopd:
+                raise ValueError("This checkpoint requires --train-e2e-loss-specopd")
         if self.checkpointer.previous_epoch != -1:
             root_logger.info(f"Found checkpoint at {self.checkpointer.prev_path}.")
             self.current_epoch = self.checkpointer.previous_epoch + 1
@@ -446,7 +523,9 @@ class Trainer:
             dist.barrier()
 
         # DDP constructor broadcasts rank 0's params to all ranks
-        self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
+        self.model = DistributedDataParallel(
+            self.model, find_unused_parameters=self.specopd_enabled
+        )  # type: ignore[assignment]
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
@@ -487,7 +566,7 @@ class Trainer:
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
             self.checkpointer.load_scheduler_state_dict(self.schedulers)
-            if self.bv_enabled:
+            if self.bv_enabled or self.specopd_enabled:
                 # Scheduler construction performs an initial step. Loading only
                 # its state does not restore optimizer param-group learning rates.
                 for scheduler in self.schedulers:
@@ -546,11 +625,16 @@ class Trainer:
 
     def train_epoch(self, epoch: int):  # noqa: C901
         self.model.train()
+        if self.specopd_enabled:
+            # Match sampled and differentiated probabilities; disable dropout only.
+            self.model.eval()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
             self.train_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
 
         # Capture full-epoch step count before any resume fast-skip mutation.
         num_steps = len(self.train_loader)
+        if self.specopd_enabled:
+            num_steps = self._specopd_steps_in_epoch
         if self.bv_enabled:
             if self._bv_resume_steps is not None and self._bv_resume_steps != num_steps:
                 raise ValueError("BV resume full-epoch length changed")
@@ -572,7 +656,7 @@ class Trainer:
         skip_steps = self._prepare_resume_skip(epoch)
 
         train_loader = self.train_loader
-        if self.bv_enabled and skip_steps:
+        if (self.bv_enabled or self.specopd_enabled) and skip_steps:
             sampler = self.train_loader.batch_sampler
             if not (
                 hasattr(sampler, "_generate_batches")
@@ -580,7 +664,9 @@ class Trainer:
             ):
                 train_loader = islice(train_loader, skip_steps, None)
         if self.rank == 0:
-            train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+            train_loader = tqdm(
+                train_loader, total=num_steps - skip_steps, desc=f"Epoch {epoch}"
+            )  # type: ignore[assignment]
 
         step_interval = (
             max(1, round(num_steps * self.config.checkpoint_freq))
@@ -615,10 +701,18 @@ class Trainer:
                     bv_annealing=annealing,
                 )
 
-            with self._bv_rng_context() if self.bv_enabled else nullcontext():
-                if self.bv_enabled:
+            with (
+                self._bv_rng_context()
+                if (self.bv_enabled or self.specopd_enabled)
+                else nullcontext()
+            ):
+                if self.bv_enabled or self.specopd_enabled:
                     # Stable anchors/dropout at the same resumed data position.
-                    seed = (self.config.bv_recipe or {}).get("seed", 42)
+                    seed = (
+                        call_kwargs["specopd_config"].get("seed", 42)
+                        if self.specopd_enabled
+                        else (self.config.bv_recipe or {}).get("seed", 42)
+                    )
                     torch.manual_seed(
                         seed + epoch * 1000000007 + local_step * 1009 + self.rank
                     )
@@ -631,6 +725,8 @@ class Trainer:
                     )
 
             should_update = True
+            if self.specopd_enabled:
+                should_update = metrics["specopd_global_positions"].item() > 0
             if self.bv_enabled:
                 loss, should_update = scale_bv_for_backward(
                     loss, metrics["bv_loss_total"]
@@ -699,18 +795,20 @@ class Trainer:
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
-        if not self.bv_enabled:
+        if not (self.bv_enabled or self.specopd_enabled):
             return self._val_epoch(epoch)
         with self._bv_rng_context():
             torch.manual_seed(42)
             return self._val_epoch(epoch)
 
-    def _val_epoch(self, epoch: int) -> dict[str, float] | None:
+    def _val_epoch(self, epoch: int) -> dict[str, float] | None:  # noqa: C901
         if self.val_loader is None:
             return None
         self.model.eval()
         if hasattr(self.val_loader.batch_sampler, "set_epoch"):
-            self.val_loader.batch_sampler.set_epoch(0 if self.bv_enabled else epoch)  # type: ignore[union-attr]
+            self.val_loader.batch_sampler.set_epoch(
+                0 if (self.bv_enabled or self.specopd_enabled) else epoch
+            )  # type: ignore[union-attr]
         val_loader = self.val_loader
         if self.rank == 0:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
@@ -747,6 +845,8 @@ class Trainer:
                 val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
 
         world_size = dist.get_world_size() if self.is_distributed else 1
+        if self.specopd_enabled and val_metrics.get("loss_total", 0) == 0:
+            raise ValueError("SpecOPD validation has no valid positions")
         if self.bv_enabled and val_metrics.get("bv_loss_total", 0) == 0:
             raise ValueError("BV validation has no complete valid blocks")
         val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
@@ -772,7 +872,12 @@ class Trainer:
             return
 
         root_logger.info(f"Saving checkpoint to {self.checkpointer.path / str(epoch)}")
-        self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
+        self.checkpointer.save_checkpoint(
+            self.model,
+            self.optimizers,
+            epoch,
+            **({"float_dtype": torch.float32} if self.specopd_enabled else {}),
+        )
         if self.schedulers:
             self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
         if isinstance(epoch, int):
@@ -798,10 +903,15 @@ class Trainer:
             return
 
         if self.config.save_best:
-            self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
+            self.checkpointer.save_checkpoint(
+                self.model,
+                self.optimizers,
+                epoch,
+                **({"float_dtype": torch.float32} if self.specopd_enabled else {}),
+            )
             if self.schedulers:
                 self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
-            if self.bv_enabled:
+            if self.bv_enabled or self.specopd_enabled:
                 self._save_training_state(epoch, local_step=0)
         elif self.config.checkpoint_freq >= 1 and not (
             epoch == 0 or (epoch + 1) % int(self.config.checkpoint_freq) == 0

@@ -760,6 +760,49 @@ def main(args: argparse.Namespace):  # noqa: C901
 
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
+    if args.train_e2e_loss_specopd:
+        if (
+            draft_model.use_draft_vocab
+            or draft_model.markov_head is None
+            or draft_model.markov_head.head_type != "vanilla"
+        ):
+            raise ValueError("SpecOPD requires full-vocabulary vanilla-Markov DSpark")
+        if draft_model.block_size <= int(not draft_model.config.sample_from_anchor):
+            raise ValueError("SpecOPD requires at least one proposal position")
+        specopd_config = {
+            "objective": "dspark-specopd-e2etv-v1",
+            "num_anchors": args.specopd_num_anchors,
+            "temperature": args.specopd_temperature,
+            "concurrency": args.specopd_target_concurrency,
+            "loss_chunk_size": args.specopd_loss_chunk_size,
+            "target_hidden_norm": args.specopd_target_hidden_norm,
+            "target_hidden_size": hidden_size,
+            "endpoints": args.vllm_endpoint,
+            "server_model": args.specopd_server_model,
+            "verifier_name_or_path": args.verifier_name_or_path,
+            "request_timeout": args.request_timeout,
+            "max_retries": args.max_retries,
+            "confidence_alpha": args.confidence_head_alpha,
+            "enable_confidence_head": draft_model.config.enable_confidence_head,
+            "confidence_head_with_markov": (
+                draft_model.config.confidence_head_with_markov
+            ),
+            "block_size": draft_model.block_size,
+            "sample_from_anchor": draft_model.config.sample_from_anchor,
+            "target_layer_ids": list(draft_model.target_layer_ids),
+            "seed": args.seed,
+            "data_path": str(Path(args.data_path).resolve()),
+            "total_seq_len": args.total_seq_len,
+            "train_data_ratio": args.train_data_ratio,
+        }
+        train_call_kwargs = {"specopd_config": specopd_config}
+        val_call_kwargs = {"specopd_config": dict(specopd_config)}
+        logger.info(
+            "SpecOPD: E2E-TV + %s * confidence BCE (when head exists); "
+            "legacy --loss-fn=%s is ignored. Fresh branch target scoring enabled.",
+            args.confidence_head_alpha,
+            args.loss_fn,
+        )
 
     trainer_config = TrainerConfig(
         num_epochs=args.epochs,
@@ -1030,7 +1073,37 @@ def validate_training_loss_config(parser, args):
         parser.error(str(exc))
 
 
-def parse_args():
+def validate_specopd_args(parser, args):  # noqa: C901
+    if not args.train_e2e_loss_specopd:
+        return
+    if args.speculator_type != "dspark":
+        parser.error("--train-e2e-loss-specopd requires --speculator-type dspark")
+    if args.enable_tree_training or args.enable_bv_loss:
+        parser.error("SpecOPD is mutually exclusive with TreeSpark and BV")
+    if args.fsdp_shard:
+        parser.error("SpecOPD currently supports single-device and DDP, not FSDP")
+    if args.hidden_states_backend != "file":
+        parser.error("SpecOPD branch scoring currently requires the file backend")
+    if args.noise_std != 0:
+        parser.error(
+            "SpecOPD requires --noise-std 0 for unperturbed reference features"
+        )
+    if args.per_position_loss_weight == "dpace" or args.loss_weight_schedule:
+        parser.error("SpecOPD cannot use DPACE or legacy loss weight schedules")
+    for name in (
+        "specopd_num_anchors",
+        "specopd_target_concurrency",
+        "specopd_loss_chunk_size",
+    ):
+        if getattr(args, name) <= 0:
+            parser.error(f"{name} must be positive")
+    if not math.isfinite(args.specopd_temperature) or args.specopd_temperature <= 0:
+        parser.error("--specopd-temperature must be finite and positive")
+    if not math.isfinite(args.confidence_head_alpha) or args.confidence_head_alpha < 0:
+        parser.error("--confidence-head-alpha must be finite and nonnegative")
+
+
+def parse_args():  # noqa: C901
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--draft-use-mla",
@@ -1607,8 +1680,8 @@ def parse_args():
     parser.add_argument(
         "--noise-std",
         type=float,
-        default=0.05,
-        help="Standard deviation for noise augmentation",
+        default=None,
+        help="Noise standard deviation (default: 0 for SpecOPD, otherwise 0.05)",
     )
     # Checkpoint Parameters
     parser.add_argument(
@@ -1690,7 +1763,34 @@ def parse_args():
         help="Muon LR adjustment. 'match_rms_adamw' matches AdamW's update RMS.",
     )
 
+    parser.add_argument(
+        "--train-e2e-loss-specopd",
+        action="store_true",
+        help="Train original DSpark on fresh draft branches with E2E-TV",
+    )
+    parser.add_argument(
+        "--specopd-num-anchors",
+        type=int,
+        default=8,
+        help="Maximum sampled anchors per packed batch per rank",
+    )
+    parser.add_argument("--specopd-temperature", type=float, default=1.0)
+    parser.add_argument("--specopd-target-concurrency", type=int, default=4)
+    parser.add_argument("--specopd-loss-chunk-size", type=int, default=4)
+    parser.add_argument(
+        "--specopd-target-hidden-norm",
+        choices=["pre", "post"],
+        default="pre",
+        help="Whether connector final-layer states precede target RMSNorm",
+    )
+    parser.add_argument(
+        "--specopd-server-model",
+        default=None,
+        help="Served model alias; defaults to --verifier-name-or-path",
+    )
     args = parser.parse_args()
+    if args.noise_std is None:
+        args.noise_std = 0.0 if args.train_e2e_loss_specopd else 0.05
 
     if args.vllm_endpoint is None:
         args.vllm_endpoint = ["http://localhost:8000/v1"]
@@ -1712,6 +1812,7 @@ def parse_args():
 
     validate_bv_args(parser, args)
     validate_tree_training_args(parser, args)
+    validate_specopd_args(parser, args)
 
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":

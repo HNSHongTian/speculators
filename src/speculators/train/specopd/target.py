@@ -20,6 +20,15 @@ class BranchTarget:
         if not n:
             return torch.empty(0, cfg["target_hidden_size"])
         tokens = prefix + samples[: n - 1]
+        start = len(prefix) - 1
+        rows = self.read_states(tokens, index, slice(start, start + n), final_only=True)
+        if len(rows) != n:
+            raise ValueError("Invalid SpecOPD teacher prediction rows")
+        return rows
+
+    def read_states(self, tokens, index=0, positions=None, *, final_only=False):
+        """Read validated CPU states for training or multi-round verification."""
+        cfg = self.config
         endpoint = cfg["endpoints"][index % len(cfg["endpoints"])]
         transfer = FileTransfer(Path())
         # Workers only manipulate CPU tensors; no GPU work in HTTP threads.
@@ -53,9 +62,11 @@ class BranchTarget:
                 hidden = states[:, -1]
                 if hidden.ndim != 2 or hidden.shape[1] != cfg["target_hidden_size"]:  # noqa: PLR2004
                     raise ValueError("Unexpected SpecOPD teacher hidden-state shape")
-                start = len(prefix) - 1
-                rows = hidden[start : start + n].clone()
-                if len(rows) != n or not torch.isfinite(rows).all():
+                rows = hidden if final_only else states
+                if positions is not None:
+                    rows = rows[positions]
+                rows = rows.clone()
+                if not torch.isfinite(rows).all():
                     raise ValueError("Invalid SpecOPD teacher prediction rows")
                 return rows
             finally:

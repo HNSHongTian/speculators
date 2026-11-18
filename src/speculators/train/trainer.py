@@ -43,6 +43,10 @@ from speculators.train.distributed import (
 )
 from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
+from speculators.train.specopd.evaluation import (
+    evaluate_acceptance,
+    select_eval_prompts,
+)
 from speculators.train.utils import normalize_counted_metrics
 
 root_logger = logging.getLogger("speculators")
@@ -242,6 +246,7 @@ class Trainer:
                 "request_timeout",
                 "max_retries",
                 "server_model",
+                "evaluation",
             }
         }
         recipe.update(
@@ -460,7 +465,11 @@ class Trainer:
                     self._bv_resume_steps = bv_state["steps_in_full_epoch"]
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
-            saved = self.checkpointer.load_best_val_loss()
+            # Pre-v2 SpecOPD DDP metrics used aliased reduction buffers. Never
+            # compare corrected validation losses with a corrupted old best loss.
+            saved = self.checkpointer.load_best_val_loss(
+                **({"specopd_metrics_version": 2} if self.specopd_enabled else {})
+            )
             if saved is not None:
                 self.best_val_loss = saved
                 root_logger.info(
@@ -623,11 +632,73 @@ class Trainer:
             )
         return skip_steps
 
+    def maybe_evaluate_specopd(self):  # noqa: C901
+        """Synchronize ranks around rank-zero inference, without DDP forward."""
+        if not self.specopd_enabled:
+            return
+        config = self.config.train_call_kwargs["specopd_config"]
+        evaluation = config.get("evaluation", {})
+        interval = evaluation.get("interval", 0)
+        if not interval or self.global_step % interval:
+            return
+        if getattr(self, "_specopd_last_eval_step", None) == self.global_step:
+            return
+        error = None
+        model = (
+            self.model.module
+            if isinstance(self.model, DistributedDataParallel)
+            else self.model
+        )
+        if self.rank == 0:
+            was_training = model.training
+            try:
+                if not hasattr(self, "_specopd_eval_prompts"):
+                    if self.val_loader is None:
+                        raise ValueError(
+                            "SpecOPD AL evaluation requires validation data"
+                        )
+                    self._specopd_eval_prompts = select_eval_prompts(
+                        self.val_loader.dataset,
+                        evaluation["samples"],
+                        evaluation["max_prompt_tokens"],
+                    )
+                with (
+                    self._bv_rng_context(),
+                    torch.autocast(
+                        self.device_type, dtype=self.config.hidden_states_dtype
+                    ),
+                ):
+                    torch.manual_seed(evaluation["seed"])
+                    model.eval()
+                    metrics = evaluate_acceptance(
+                        model, self._specopd_eval_prompts, config
+                    )
+                metric_logger.info(
+                    {"eval": metrics, "global_step": self.global_step},
+                    extra={"step": self.global_step},
+                )
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+            finally:
+                model.train(was_training)
+        if self.is_distributed:
+            # Peers wait here instead of proceeding into the next DDP forward.
+            failed = torch.tensor(
+                int(error is not None), device=next(model.parameters()).device
+            )
+            dist.broadcast(failed, src=0)
+            if failed.item():
+                raise RuntimeError("SpecOPD AL evaluation failed on rank 0") from error
+        elif error is not None:
+            raise error
+        self._specopd_last_eval_step = self.global_step
+
     def train_epoch(self, epoch: int):  # noqa: C901
         self.model.train()
         if self.specopd_enabled:
             # Match sampled and differentiated probabilities; disable dropout only.
             self.model.eval()
+            self.maybe_evaluate_specopd()
         if hasattr(self.train_loader.batch_sampler, "set_epoch"):
             self.train_loader.batch_sampler.set_epoch(epoch)  # type: ignore[union-attr]
 
@@ -792,6 +863,10 @@ class Trainer:
                 # Avoid saving back to back ay the end of each epoch
             ):
                 self.maybe_save_checkpoint(epoch, local_step=local_step)
+            if self.specopd_enabled:
+                self.maybe_evaluate_specopd()
+                # Keep evaluation separate from training throughput / fetch time.
+                t_before_fetch = time.perf_counter()
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
@@ -852,6 +927,8 @@ class Trainer:
         val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
         val_metrics = normalize_counted_metrics(val_metrics, world_size)
         val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
+        if self.specopd_enabled:
+            val_metrics["specopd_metrics_version_epoch"] = 2
 
         metric_logger.info(
             {"val": val_metrics, "epoch": epoch}, extra={"step": self.global_step}

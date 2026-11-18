@@ -112,3 +112,70 @@ EOS、上下文隔离和断点恢复。仍需在实际 GPU/NPU 与 teacher 服�
 本次验证：SpecOPD、BV、TreeSpark forward、损失权重调度、原始训练脚本及 scheduler
 共 67 项 CPU 单元/回归测试通过；DDP 的不均匀样本数归一化经过模拟验证，
 尚未完成真实多进程、多 GPU 的训练验证。
+
+## 定期测量实际接受长度
+
+在现有训练命令中添加：
+
+```bash
+--specopd-eval-interval 100 \
+--specopd-eval-samples 4 \
+--specopd-eval-max-new-tokens 64 \
+--specopd-eval-temperature 0
+```
+
+默认 interval=0，关闭额外评测。开启后在 step 0（初始化/加载权重之后、更新之前）
+和每 100 个训练 batch 后测量当前权重。恢复时按已保存的 global step 继续排期。
+这项监控可在恢复时开启或调整，不改变训练 recipe、optimizer、scheduler。
+评测用独立随机种子（`--specopd-eval-seed` 默认 1234），不消耗训练随机流。
+只有 rank 0 执行评测，其余 rank 等待；评测错误会同步给各 rank，避免继续训练造成卡死。
+
+从 Arrow 验证分区顺序选取固定的前 N 条合格 prompt，截取到第一个有效回答 token 之前，
+不使用参考答案作为生成历史。超过 `--specopd-eval-max-prompt-tokens`（默认 2048）的 prompt
+跳过，不截断。日志记录实际样本数和 prompt hash，便于确认不同 checkpoint 的评测集合一致。
+如果没有合格 prompt，报错，不退回训练集。
+
+每条 prompt 连续执行多轮原始 DSpark draft/teacher verify，首个拒绝位置后使用
+teacher 修正 token 继续生成。温度 0 为 greedy；正温度使用完整词表的
+`min(1, p(token)/q(token))` 接受检验，以及 `max(p-q, 0)` 的残差重采样。
+全部接受后从 teacher 分布采样额外 token。EOS 和输出长度限制立即终止生成。
+评测温度独立于训练温度，可以训练 T=1、评测 T=0。
+
+新增 `eval/` 日志（也可通过 `--logger tensorboard` 写入 TensorBoard）：
+
+| 指标 | 定义 |
+| --- | --- |
+| `specopd_acceptance_length` | `1 + 实际接受草稿 token 总数 / 验证轮数`，按轮加权的常用 AL |
+| `specopd_acceptance_length_request_mean` | 每条请求分别计算 AL，再按请求平均 |
+| `specopd_accepted_draft_length` | 每轮实际接受的草稿 token 数，不含额外 teacher token |
+| `specopd_emitted_tokens_per_round` | 实际输出 token 总数 / 轮数；EOS/长度边界处不会补记不存在的额外 token |
+| `specopd_acceptance_rate` | 接受的草稿 token 数 / 提出的草稿 token 数 |
+| `specopd_verification_rounds` | 实际验证轮数 |
+| `specopd_eval_seconds` | 额外评测耗时，不计入训练 step profile |
+
+这是固定宽度、线性草稿、完整词表的真实多轮验证，不启用 confidence 动态截断、树搜索、
+top-k/top-p。它用于比较训练中各 checkpoint 的接受能力，不等同于任意 serving 配置的结果。
+teacher 使用完整前缀请求，额外开销明显，不应据此衡量线上吞吐。
+服务 context limit 需容纳 prompt + max_new_tokens + 协议额外生成的 1 token。
+现有 best checkpoint 仍按验证 loss 选择，不自动改为按 AL 选择。
+
+## 多卡指标归约修复
+
+旧代码多个 `*_total` 和 `specopd_supervised_tokens` 通过 `count.detach()` 共享存储。
+逐指标的原地 reduce/all_reduce 会重复修改该计数，导致日志 loss、confidence loss、overlap
+和监督 token 数失真。现在每项返回独立 clone；训练梯度使用的 loss 分母不经过日志归约。
+修复也适用于验证指标。旧版本 best validation loss 不再与修复后的值比较，
+重新建立最佳损失基准；模型权重、optimizer、scheduler 和数据位置仍正常恢复。
+
+检查无 EOS、W=7、每卡 8 anchors 的日志时，应满足：
+
+- 每 rank `specopd_supervised_tokens = 56`；16 卡 `specopd_global_positions = 896`。
+- `specopd_e2e_loss = 1 - specopd_surrogate_length / 7`。
+- `specopd_overlap >= specopd_surrogate_length / 7`（浮点误差除外）。
+
+如果旧日志 surrogate_length=3.661，主损失应约为 0.477，不能把被错误归约后的
+0.100 解释成预训练模型已经达到该损失水平。恢复后首次新验证会重新建立正确的 best loss。
+
+新增功能与修复的最终验证：79 项 CPU 单元/回归测试通过，包含多轮验证、拒绝后历史、
+残差重采样、EOS/长度边界、RNG 隔离、模拟 16 卡日志归约和旧最佳损失迁移。
+真实 teacher 服务、16 卡 Ascend 上的 AL 评测与归约仍需实机确认。

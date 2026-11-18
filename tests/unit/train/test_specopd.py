@@ -18,6 +18,7 @@ from speculators.train.specopd.loss import specopd_loss
 from speculators.train.specopd.runtime import anchor_backbone, sample_branches
 from speculators.train.specopd.target import BranchTarget
 from speculators.train.trainer import Trainer, TrainerConfig
+from speculators.train.utils import normalize_counted_metrics
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -62,6 +63,29 @@ def test_e2e_numbers_gradient_and_detached_confidence():
     actual, conf_grad = torch.autograd.grad(loss_conf, (alpha, confidence))
     torch.testing.assert_close(actual, grad)
     torch.testing.assert_close(conf_grad, (0.5 - alpha.detach()) / 6)
+
+
+def test_distributed_metric_buffers_are_independent():
+    alpha = torch.full((8, 7), 0.85, requires_grad=True)
+    loss, metrics = specopd_loss(alpha, torch.ones_like(alpha, dtype=torch.bool))
+    expected = loss.item()
+    # Emulate all_reduce of sixteen identical ranks, mutating each metric just
+    # as the train reduce and validation all_reduce do. Old shared denominators
+    # compound here and corrupt loss, overlap and supervised-token counts.
+    for value in metrics.values():
+        value.mul_(16)
+    normalized = normalize_counted_metrics(
+        {k: v.item() for k, v in metrics.items()}, 16
+    )
+    assert normalized["specopd_supervised_tokens"] == 56
+    assert normalized["specopd_overlap"] == pytest.approx(0.85)
+    assert normalized["loss"] == pytest.approx(expected)
+    assert normalized["specopd_e2e_loss"] == pytest.approx(
+        1 - normalized["specopd_surrogate_length"] / 7
+    )
+    assert loss.item() == expected
+    loss.backward()
+    assert torch.isfinite(alpha.grad).all()
 
 
 def test_masks_and_empty_loss():
@@ -292,7 +316,7 @@ def make_trainer(path, resumed=False):
         path=path,
         previous_epoch=0 if resumed else -1,
         prev_path=path / "0",
-        load_best_val_loss=lambda: None,
+        load_best_val_loss=lambda **kwargs: None,
         scheduler_path=lambda epoch: path / "scheduler.pt",
     )
     t.setup_trainer()
@@ -437,3 +461,16 @@ def test_all_empty_step_skips_optimizer_and_scheduler(tmp_path):
     assert t.schedulers[0].last_epoch == before_step
     with pytest.raises(ValueError, match="no valid positions"):
         t.val_epoch(0)
+
+
+def test_old_corrupted_best_loss_is_not_restored(tmp_path):
+    checkpoint = SingleGPUCheckpointer(tmp_path)
+    (tmp_path / "0").mkdir()
+    (tmp_path / "checkpoint_best").symlink_to("0")
+    checkpoint.save_val_metrics(0, {"loss_epoch": 0.1})
+    assert checkpoint.load_best_val_loss() == 0.1
+    assert checkpoint.load_best_val_loss(specopd_metrics_version=2) is None
+    checkpoint.save_val_metrics(
+        0, {"loss_epoch": 0.477, "specopd_metrics_version_epoch": 2}
+    )
+    assert checkpoint.load_best_val_loss(specopd_metrics_version=2) == 0.477

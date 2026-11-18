@@ -50,4 +50,7 @@ def specopd_loss(overlap, valid, confidence=None, confidence_alpha=1.0):
             survival[:, i].detach() * valid[:, i]
         ).sum()
         metrics[f"specopd_survival_{i + 1}_total"] = valid[:, i].sum().float()
-    return loss, metrics
+    # detach() shares storage. Several denominators originate from `count`;
+    # in-place distributed reductions must not add into the same buffer twice.
+    # Also isolate logging from the tensors retained by the backward graph.
+    return loss, {name: value.detach().clone() for name, value in metrics.items()}

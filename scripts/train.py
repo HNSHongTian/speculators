@@ -794,6 +794,14 @@ def main(args: argparse.Namespace):  # noqa: C901
             "data_path": str(Path(args.data_path).resolve()),
             "total_seq_len": args.total_seq_len,
             "train_data_ratio": args.train_data_ratio,
+            "evaluation": {
+                "interval": args.specopd_eval_interval,
+                "samples": args.specopd_eval_samples,
+                "max_new_tokens": args.specopd_eval_max_new_tokens,
+                "max_prompt_tokens": args.specopd_eval_max_prompt_tokens,
+                "temperature": args.specopd_eval_temperature,
+                "seed": args.specopd_eval_seed,
+            },
         }
         train_call_kwargs = {"specopd_config": specopd_config}
         val_call_kwargs = {"specopd_config": dict(specopd_config)}
@@ -1074,6 +1082,23 @@ def validate_training_loss_config(parser, args):
 
 
 def validate_specopd_args(parser, args):  # noqa: C901
+    if args.specopd_eval_interval < 0:
+        parser.error("--specopd-eval-interval must be nonnegative")
+    if args.specopd_eval_interval:
+        if not args.train_e2e_loss_specopd or args.legacy_data:
+            parser.error("SpecOPD AL evaluation requires SpecOPD and Arrow data")
+        for name in (
+            "specopd_eval_samples",
+            "specopd_eval_max_new_tokens",
+            "specopd_eval_max_prompt_tokens",
+        ):
+            if getattr(args, name) <= 0:
+                parser.error(f"{name} must be positive")
+        if (
+            not math.isfinite(args.specopd_eval_temperature)
+            or args.specopd_eval_temperature < 0
+        ):
+            parser.error("--specopd-eval-temperature must be finite and nonnegative")
     if not args.train_e2e_loss_specopd:
         return
     if args.speculator_type != "dspark":
@@ -1788,6 +1813,22 @@ def parse_args():  # noqa: C901
         default=None,
         help="Served model alias; defaults to --verifier-name-or-path",
     )
+    parser.add_argument(
+        "--specopd-eval-interval",
+        type=int,
+        default=0,
+        help="Measure actual AL every N batches and at step 0; 0 disables",
+    )
+    parser.add_argument("--specopd-eval-samples", type=int, default=4)
+    parser.add_argument("--specopd-eval-max-new-tokens", type=int, default=64)
+    parser.add_argument("--specopd-eval-max-prompt-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--specopd-eval-temperature",
+        type=float,
+        default=0.0,
+        help="Independent evaluation temperature: 0 greedy, >0 sampling",
+    )
+    parser.add_argument("--specopd-eval-seed", type=int, default=1234)
     args = parser.parse_args()
     if args.noise_std is None:
         args.noise_std = 0.0 if args.train_e2e_loss_specopd else 0.05

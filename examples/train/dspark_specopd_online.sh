@@ -24,6 +24,10 @@ torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-1}" \
   --specopd-num-anchors "${SPECOPD_ANCHORS:-8}" \
   --specopd-target-concurrency "${TARGET_CONCURRENCY:-4}" \
   --specopd-target-hidden-norm "${TARGET_HIDDEN_NORM:-pre}" \
+  --specopd-eval-interval "${SPECOPD_EVAL_INTERVAL:-0}" \
+  --specopd-eval-samples "${SPECOPD_EVAL_SAMPLES:-4}" \
+  --specopd-eval-max-new-tokens "${SPECOPD_EVAL_MAX_NEW_TOKENS:-64}" \
+  --specopd-eval-temperature "${SPECOPD_EVAL_TEMPERATURE:-0}" \
   --epochs "${EPOCHS:-3}" --lr "${LR:-1e-5}" \
   --checkpoint-freq 0.25 --log-freq 10 \
   "${extra[@]}" "$@"

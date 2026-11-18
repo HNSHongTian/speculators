@@ -171,7 +171,9 @@ class BaseCheckpointer:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(val_metrics))
 
-    def load_best_val_loss(self) -> float | None:
+    def load_best_val_loss(
+        self, *, specopd_metrics_version: int | None = None
+    ) -> float | None:
         best_epoch = self.read_best_epoch()
         if best_epoch is None:
             return None
@@ -180,6 +182,11 @@ class BaseCheckpointer:
             return None
         try:
             data = json.loads(p.read_text())
+            if (
+                specopd_metrics_version is not None
+                and data.get("specopd_metrics_version_epoch") != specopd_metrics_version
+            ):
+                return None
             return float(data["loss_epoch"])
         except (json.JSONDecodeError, KeyError, ValueError, TypeError):
             return None

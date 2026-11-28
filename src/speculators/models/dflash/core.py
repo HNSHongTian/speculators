@@ -396,14 +396,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [num_anchors*block_size]
 
         with torch.no_grad():
-            verifier_logits = self.verifier_lm_head(
-                self.verifier_norm(verifier_last_hidden_states)
-            )
+            # Norm and LM head act per token; only project the sampled positions.
+            target_indices = anchored_block_indices
             if not self.config.sample_from_anchor:
-                # False: shift right by 1 so slot j predicts token at position j
-                verifier_logits = torch.roll(verifier_logits, 1, dims=1)
-            # else: True, slot k predicts token at position k+1 (next), no shift
-            targets = verifier_logits[:, anchored_block_indices]
+                # Match the previous right roll of logits, including position zero.
+                target_indices = (target_indices - 1) % verifier_last_hidden_states.size(1)
+            targets = self.verifier_lm_head(
+                self.verifier_norm(verifier_last_hidden_states[:, target_indices])
+            )
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
